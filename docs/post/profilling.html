@@ -16,8 +16,9 @@
 服务端：
 1. 开启sglang服务
 2. 进行压测
+
 客户端：
-在压测过程中采用以下指令
+开启压测之后，在压测过程中采用以下指令
 export SGLANG_TORCH_PROFILER_DIR=/sgl-workspace/sglang/trace_file // 这是保存采集文件的目标路径，如果不设置一般会保存到/tmp
 curl -X POST http://127.0.0.1:8000/start_profile  // 开启的开关
 curl -X POST http://127.0.0.1:8000/stop_profile  // 关闭的开关
@@ -52,8 +53,9 @@ curl -X POST http://127.0.0.1:8000/stop_profile  // 关闭的开关
 服务端：
 1. 开启sglang服务
 2. 进行压测
+
 客户端：
-在压测过程中采用以下指令
+开启压测之后，在压测过程中采用以下指令
 export SGLANG_TORCH_PROFILER_DIR=/sgl-workspace/sglang/trace_file // 这是保存采集文件的目标路径，如果不设置一般会保存到/tmp
 curl -X POST http://127.0.0.1:8000/start_profile  // 开启的开关
 curl -X POST http://127.0.0.1:8000/stop_profile  // 关闭的开关
@@ -147,15 +149,15 @@ body{box-sizing: border-box;min-width: 200px;max-width: 900px;margin: 20px auto;
 <p>服务端：</p>
 <ol>
 <li>开启sglang服务</li>
-<li>进行压测<br>
-客户端：<br>
-在压测过程中采用以下指令<br>
+<li>进行压测</li>
+</ol>
+<p>客户端：<br>
+开启压测之后，在压测过程中采用以下指令<br>
 export SGLANG_TORCH_PROFILER_DIR=/sgl-workspace/sglang/trace_file // 这是保存采集文件的目标路径，如果不设置一般会保存到/tmp<br>
 curl -X POST <a href="http://127.0.0.1:8000/start_profile" rel="nofollow">http://127.0.0.1:8000/start_profile</a>  // 开启的开关<br>
 curl -X POST <a href="http://127.0.0.1:8000/stop_profile" rel="nofollow">http://127.0.0.1:8000/stop_profile</a>  // 关闭的开关<br>
 采集的文件一般以*.trace.json.gz命名，若多个卡则有多个该文件<br>
-注意：采集了10s左右，大概3个G大小</li>
-</ol>
+注意：采集了10s左右，大概3个G大小</p>
 <h3>vllm</h3>
 <p>【待施工】</p>
 <h2>hta</h2>

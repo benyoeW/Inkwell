@@ -4,8 +4,9 @@
 服务端：
 1. 开启sglang服务
 2. 进行压测
+
 客户端：
-在压测过程中采用以下指令
+开启压测之后，在压测过程中采用以下指令
 export SGLANG_TORCH_PROFILER_DIR=/sgl-workspace/sglang/trace_file // 这是保存采集文件的目标路径，如果不设置一般会保存到/tmp
 curl -X POST http://127.0.0.1:8000/start_profile  // 开启的开关
 curl -X POST http://127.0.0.1:8000/stop_profile  // 关闭的开关
