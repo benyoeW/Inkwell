@@ -1,0 +1,2076 @@
+<!DOCTYPE html>
+<html data-color-mode="light" data-dark-theme="dark" data-light-theme="light" lang="zh-CN">
+<head>
+    <meta content="text/html; charset=utf-8" http-equiv="content-type" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <link href='https://mirrors.sustech.edu.cn/cdnjs/ajax/libs/Primer/21.0.7/primer.css' rel='stylesheet' />
+    
+    <link rel="icon" href="https://github.githubassets.com/favicons/favicon.svg"><script>
+        let theme = localStorage.getItem("meek_theme") || "light";
+        document.documentElement.setAttribute("data-color-mode", theme);
+    </script>
+<meta name="description" content="1. RequestA进入等待队列
+2. 调度器发现RequestA有远程KV → 设置为WAITING_FOR_REMOTE_KVS
+3. 启动异步传输，RequestA放入skipped队列
+4. 调度器处理RequestB、RequestC（不阻塞！）
+5. Worker异步传输KV缓存到本地
+6. 下一轮调度：检查RequestA传输状态
+7. 传输完成 → RequestA状态改为WAITING
+8. RequestA可以进行正常调度分配
+
+
+## 整体流程：
+可以先看一下waiting的代码；
+
+一个请求从sheduler侧开始：
+  **某schedule轮次**：先获取远端可传输的token --> 申请显存空间 --> 构造远端传输的元数据 --> 异步的话更改请求状态(end)
+  **某schedule轮次**：若请求状态为等待KV传输-->是否传输就绪-->是则为申请的显存缓存KV，并更改请求状态--〉调度（end）
+                                                                                                      -->否则让请求进入临时队列（end）
+
+**某update_from_output轮次**：（......）--》worker侧完成传输之后，将 KVconnector 中完成的请求放到 scheduler类中的 finished_recving_kv_req_ids 中
+**某schedule轮次**：_update_waiting_for_remote_kv 检查finished_recving_kv_req_ids远程传输KV请求是否就绪，若就绪更新分配block的元数据（**传输完成后则说明该KV已经分配到对应block当中了**）
+
+shceduler.py代码
+```
+        # Next, schedule the WAITING requests. ==========================================================
+        if not preempted_reqs:
+            while self.waiting and token_budget > 0:
+                if len(self.running) == self.max_num_running_reqs:
+                    break
+
+                request = self.waiting.peek_request()
+
+                # KVTransfer: skip request if still waiting for remote kvs.
+                if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    # 检查远程KV是否就绪，并存入分配的显存
+                    is_ready = self._update_waiting_for_remote_kv(request)
+                    if is_ready:
+                        if request.num_preemptions:
+                            # We must be loading for a resumed preemption
+                            # rather than a new request.
+                            request.status = RequestStatus.PREEMPTED
+                        else:
+                            request.status = RequestStatus.WAITING
+                    else:
+                        logger.debug(
+                            '%s is still in WAITING_FOR_REMOTE_KVS state.',
+                            request.request_id,
+                        )
+                        self.waiting.pop_request()
+                        # 这里放入了临时队列
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+                        # 然后在调度其他请求结束的时候，检查临时队列，将临时队列的req放到waitting队列
+
+                # Skip request if the structured output request is still waiting
+                # for FSM compilation.
+                if request.status == RequestStatus.WAITING_FOR_FSM:
+                    structured_output_req = request.structured_output_request
+                    if structured_output_req and structured_output_req.grammar:
+                        request.status = RequestStatus.WAITING
+                    else:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+
+                # Streaming: skip request if still waiting for next streaming req.
+                if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                    assert not request.streaming_queue
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+                # Check that adding the request still respects the max_loras
+                # constraint.
+                if (
+                    self.lora_config
+                    and request.lora_request
+                    and (
+                        len(scheduled_loras) == self.lora_config.max_loras
+                        and request.lora_request.lora_int_id not in scheduled_loras
+                    )
+                ):
+                    # Scheduling would exceed max_loras, skip.
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+                num_external_computed_tokens = 0
+                load_kv_async = False
+
+                # Get already-cached tokens.
+
+                # num_computed_tokens ==0 表示还没开始KV传输的相关计算
+                # 抢占KVcache会抢占整个请求的，不会只抢占单个请求的部分KV，
+                # 所以如果num_computed_tokens！=0，不需要connector加载远程KV
+                if request.num_computed_tokens == 0:
+                    # Get locally-cached tokens.
+                    new_computed_blocks, num_new_local_computed_tokens = (
+                        self.kv_cache_manager.get_computed_blocks(request)
+                    )
+
+                    # Get externally-cached tokens if using a KVConnector.
+                    # 通过connector获取远程可以加载多少个token的KVcache
+                    if self.connector is not None:
+                        # 通过connector获取远程是否有已经计算的token的KVcache
+                        ext_tokens, load_kv_async = (
+                            self.connector.get_num_new_matched_tokens(
+                                request, num_new_local_computed_tokens
+                            )
+                        )
+                        # 表示无法确定查询情况（不是为0），暂时不调度本请求，将本请求放入临时队列
+                        if ext_tokens is None:
+                            # The request cannot be scheduled because
+                            # the KVConnector couldn't determine
+                            # the number of matched tokens.
+                            self.waiting.pop_request()
+                            skipped_waiting_requests.prepend_request(request)
+                            continue
+
+                        request.num_external_computed_tokens = ext_tokens
+                        num_external_computed_tokens = ext_tokens
+
+                    # Total computed tokens (local + external).
+                    # 加载远程之后重新赋值num_computed_tokens
+                    num_computed_tokens = (
+                        num_new_local_computed_tokens + num_external_computed_tokens
+                    )
+                else:
+                    # KVTransfer: WAITING reqs have num_computed_tokens > 0
+                    # after async KV recvs are completed.
+                    # 在传输好KV之前就已经标记好了该请求的num_computed_tokens
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_new_local_computed_tokens = 0
+                    num_computed_tokens = request.num_computed_tokens
+
+                encoder_inputs_to_schedule = None
+                external_load_encoder_input = []
+                new_encoder_compute_budget = encoder_compute_budget
+
+                # 对于offloading connector，如果有命中远端KV，load_kv_async默认为异步，否则为同步
+
+                # 异步加载，加载本请求的KVcache同时处理其他请求
+                if load_kv_async:
+                    # KVTransfer: loading remote KV, do not allocate for new work.
+                    assert num_external_computed_tokens > 0
+                    # 这里不进行调度，只分配显存
+                    num_new_tokens = 0
+                    # 后面设置请求的状态为WAITING_FOR_REMOTE_KVS
+
+                # 同步加载，获取调度的token个数
+                else:
+                    # Number of tokens to be scheduled.
+                    # We use `request.num_tokens` instead of
+                    # `request.num_prompt_tokens` to consider the resumed
+                    # requests, which have output tokens.
+                    num_new_tokens = request.num_tokens - num_computed_tokens
+                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    if 0 < threshold < num_new_tokens:
+                        num_new_tokens = threshold
+
+                    # chunked prefill has to be enabled explicitly to allow
+                    # pooling requests to be chunked
+                    if (
+                        not self.scheduler_config.enable_chunked_prefill
+                        and num_new_tokens > token_budget
+                    ):
+                        # If chunked_prefill is disabled,
+                        # we can stop the scheduling here.
+                        break
+
+                    num_new_tokens = min(num_new_tokens, token_budget)
+                    assert num_new_tokens > 0
+
+                    # Schedule encoder inputs.
+                    if request.has_encoder_inputs:
+                        (
+                            encoder_inputs_to_schedule,
+                            num_new_tokens,
+                            new_encoder_compute_budget,
+                            external_load_encoder_input,
+                        ) = self._try_schedule_encoder_inputs(
+                            request,
+                            num_computed_tokens,
+                            num_new_tokens,
+                            encoder_compute_budget,
+                            shift_computed_tokens=1 if self.use_eagle else 0,
+                        )
+                        if num_new_tokens == 0:
+                            # The request cannot be scheduled.
+                            break
+
+                if self.need_mamba_block_aligned_split:
+                    num_new_tokens = self._mamba_block_aligned_split(
+                        request,
+                        num_new_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+                    if num_new_tokens == 0:
+                        break
+
+                # Handles an edge case when P/D Disaggregation
+                # is used with Spec Decoding where an
+                # extra block gets allocated which
+                # creates a mismatch between the number
+                # of local and remote blocks.
+                effective_lookahead_tokens = (
+                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                )
+
+                num_encoder_tokens = (
+                    self._num_encoder_max_input_tokens
+                    if self.is_encoder_decoder and request.has_encoder_inputs
+                    else 0
+                )
+                # 在本地申请新的KV cache的空间
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_new_tokens, # 总的token数量 - 已经计算KV的token数量
+                    num_new_computed_tokens=num_new_local_computed_tokens, # 本地的KVcache
+                    new_computed_blocks=new_computed_blocks,
+                    num_lookahead_tokens=effective_lookahead_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens, # 远程已经计算好的KVcache
+                    delay_cache_blocks=load_kv_async, # 这里应该是是否先延迟远端KVcache的加载
+                    num_encoder_tokens=num_encoder_tokens,
+                )
+
+                if new_blocks is None:
+                    # The request cannot be scheduled.
+
+                    # NOTE: we need to untouch the request from the encode cache
+                    # manager
+                    if request.has_encoder_inputs:
+                        self.encoder_cache_manager.free(request)
+                    break
+
+                # KVTransfer: the connector uses this info to determine
+                # if a load is needed. Note that
+                # This information is used to determine if a load is
+                # needed for this request.
+
+                # ========================================================================
+
+                # KVcache传输触发链路：
+                # scheduler端 在申请完显存之后，通过 update_state_after_alloc 将元数据传输到worker侧
+                # Worker端    持续监听传输队列，执行传输，并更新scheduler端的请求状态
+                # scheduler端 _update_waiting_for_remote_kv 检查远程KV是否就绪，若就绪则存入分配好的显存
+                
+                # ========================================================================
+
+                if self.connector is not None:
+                    # connector更新request的block，远端的KVcache加载的 Metadata
+                    self.connector.update_state_after_alloc(   # 如果传输完成，update_state_after_alloc函数会直接返回
+                        request,
+                        self.kv_cache_manager.get_blocks(request.request_id),
+                        num_external_computed_tokens,
+                    )
+
+                # Request was already popped from self.waiting
+                # unless it was re-added above due to new_blocks being None.
+                request = self.waiting.pop_request()
+
+                # 如果是异步的话，更改请求的状态为WAITING_FOR_REMOTE_KVS，不进行调度，添加到临时队列中
+                if load_kv_async:
+                    # 如果请求远程KV传输完成，
+                    # If loading async, allocate memory and put request
+                    # into the WAITING_FOR_REMOTE_KV state.
+                    skipped_waiting_requests.prepend_request(request)
+                    # 将该请求标记为异步加载远端KV状态
+                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    continue   # 异步到此end
+
+                # 如果是非异步的话，直接可以进行推理了，在执行模型前向的时候，在进行每个layer的attn计算之前等待加载完成
+
+                self._update_connector_prefix_cache_stats(request)
+
+                # 进行调度，添加到running队列中
+                self.running.append(request)
+                if self.log_stats:
+                    request.record_event(
+                        EngineCoreEventType.SCHEDULED, scheduled_timestamp
+                    )
+                if request.status == RequestStatus.WAITING:
+                    scheduled_new_reqs.append(request)
+                elif request.status == RequestStatus.PREEMPTED:
+                    scheduled_resumed_reqs.append(request)
+                else:
+                    raise RuntimeError(f'Invalid request status: {request.status}')
+
+                if self.lora_config and request.lora_request:
+                    scheduled_loras.add(request.lora_request.lora_int_id)
+                # 获取该请求的kv block信息
+                req_to_new_blocks[request.request_id] = (
+                    self.kv_cache_manager.get_blocks(request.request_id)
+                )
+                # 记录调度的token数量，缩减token_budget
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                request.status = RequestStatus.RUNNING
+                request.num_computed_tokens = num_computed_tokens
+                # Count the number of prefix cached tokens.
+                if request.num_cached_tokens < 0:
+                    request.num_cached_tokens = num_computed_tokens
+
+```
+
+
+**scheduler**端调用build_connector_meta()
+构建需要传输的请求元数据（包括块ID、请求ID、token数量）
+返回KVConnectorMetadata对象
+
+worker侧的gpu.model_runner在前向计算之前执行：
+```
+        # Run model.
+        if use_cudagraph:
+            # Run CUDA graph.
+            # NOTE(woosuk): Here, we don't need to pass the input tensors,
+            # because they are already copied to the CUDA graph input buffers.
+
+            # 绑定metadata，开始KV传输
+            self.kv_connector.pre_forward(scheduler_output)
+
+            # 请求分为KV传输与非KV传输的
+            # 对于KV传输的请求，根据connector类型，决定是否异步加载
+            #   若为异步传输：scheduler侧会将该请求的 num_new_tokens = 0,该请求本次不会进行前向计算
+            #   若为同步传输：num_new_tokens正常计算，通过layer by layer进行前向计算
+            # 对于非KV传输的请求：直接进行前向计算
+
+            # 用cuda graph方式进行前向计算
+            hidden_states = self.cudagraph_manager.run(
+                input_batch.num_tokens_after_padding
+            )
+        else:
+            .......
+
+        # 前向执行完毕之后，
+        kv_connector_output = self.kv_connector.post_forward(scheduler_output)   # 
+        self.execute_model_state = hidden_states, input_batch, kv_connector_output
+        return None
+```
+
+**worker**端接收到scheduler_output后：
+提取kv_connector_metadata
+调用bind_connector_metadata()绑定元数据
+调用start_load_kv()开始异步加载
+模型前向执行完毕之后调用self.kv_connector.post_forward(scheduler_output)
+post_forward调用链路：
+│    └── post_forward()      # 获取传输完成的请求 ID                                                    
+│          │                                                                    
+│         ├ ── get_finished()                                                   
+│          │     └── OffloadingConnectorWorker.get_finished()   # 检查所有传输任务是否完成
+│          │           └── OffloadingWorker.get_finished() 【offloading_connector.py】
+│          │                 └── SingleDirectionOffloadingHandler.get_finished()【cpu_gpu.py】     # 返回完成的 job_id     
+│          │                       └── event.query() 检查传输完成              
+                  
+
+## 举例：
+Scheduler端：
+1. 请求A分配blocks [4,5,6], 需要传输35个token
+2. 构建ReqMeta(request_id='A', block_ids=[4,5,6], num_tokens=35)
+3. 放入P2pNcclConnectorMetadata.requests列表
+
+Worker端：
+1. 解析metadata获取blocks [4,5,6]
+2. 启动异步DMA传输：
+   - block4: tokens 0-15
+   - block5: tokens 16-31 
+   - block6: tokens 32-34 (最后3个token)
+3. 传输完成后标记请求A为可调度状态
+
+注意点：
+如果已经通过connector计算好外部token数量等信息，就直接给num_computed_token赋值了，虽说还没加载完成；
+
+对比：
+不使用OffloadingConnector：
+```
+# 调用链
+用户 -> vllm.LLM.genreate()           # 入口
+      -> vllm/v1/engine.py           # 引擎
+      -> vllm/v1/core/sched/scheduler.py  # 基础调度
+      -> vllm/v1/worker/model_runner.py   # 模型执行
+      -> vllm/attention/layers/*.py  # 注意力计算
+```
+使用OffloadingConnector：
+```
+# 调用链（扩展）
+用户 -> vllm.LLM.generate()          # 入口
+      -> vllm/v1/engine.py           # 引擎（检测KVTransferConfig）
+      -> vllm/v1/core/sched/scheduler.py  # 调度+Connector决策
+           ↳ vllm/distributed/kv_transfer/kv_connector/factory.py
+           ↳ vllm/v1/kv_offload/factory.py
+           ↳ vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+           ↳ vllm/v1/kv_offload/arc_manager.py
+      
+      -> vllm/v1/worker/model_runner.py   # 执行+传输
+           ↳ vllm/v1/worker/kv_connector_model_runner_mixin.py
+           
+      -> vllm/attention/layers/*.py  # 注意力计算+传输同步
+           ↳ vllm/attention/utils/kv_transfer_utils.py
+```
+
+
+connector维护了两个role：scheduler和worker
+
+这两个role对应的方法可以被vllm中对应的结构进行调用
+
+## scheduler
+场景设定
+用户请求：prompt = '北京是中国的首都，它的人口是'  (10个token)
+远端 Prefill 机器 已经算过这个 prompt 的前8个token的 KV Cache
+本地 已经缓存了前3个token的 KV Cache
+**get_num_new_matched_tokens()**
+**update_state_after_alloc()**
+**build_connector_meta()**
+
+```
+Scheduler Step:
+
+  [新请求 req_A 进来]
+       ↓
+  get_num_new_matched_tokens(req_A, num_computed=3)
+  → 返回 (5, True)  '远端有5个token可以给你'
+       ↓
+  KVCacheManager 分配 block_0, block_1 给这5个token
+       ↓
+  update_state_after_alloc(req_A, blocks, num_external=5)
+  → Connector 内部记录: 'block_0,1 要从远端拉数据'
+       ↓
+  ... 处理其他请求 ...
+       ↓
+  build_connector_meta(scheduler_output)
+  → 把所有请求的传输任务打包成 metadata
+  → 清空内部状态
+  → 返回 meta
+       ↓
+  meta 被发送到 Worker 进程
+       ↓
+  Worker: start_load_kv() 根据 meta 真正开始传数据
+```
+
+## worker
+```
+═══════════════════════════════════════════════════════
+                    WORKER 侧
+═══════════════════════════════════════════════════════
+
+⑤ bind_connector_metadata(meta)
+  └─ self._connector_metadata = meta
+  └─ Worker 现在知道要干什么了
+
+⑥ start_load_kv(forward_context)
+  └─ 读取 meta: req_A 需要从 10.0.0.1 拉 block_0, block_1
+  └─ 后台线程异步开始拉数据
+  └─ 立刻返回，开始前向传播
+
+  [前向传播开始，逐层执行]
+
+  --- Layer 0 ---
+⑦  wait_for_layer_load('layer_0')
+    └─ 等待 layer_0 的KV数据到达（可能短暂阻塞）
+    └─ 数据到了 → 返回
+
+    [执行 layer_0 的 Attention 计算]
+    output_0 = attention_0(input, kv_cache[layer_0])
+
+⑧  save_kv_layer('layer_0', kv_cache['layer_0'], attn_meta)
+    └─ 提取 req_B 对应的KV数据
+    └─ 放入发送队列，异步发送给 10.0.0.2
+    └─ 立刻返回
+
+  --- Layer 1 ---
+⑦  wait_for_layer_load('layer_1')
+    └─ 等 layer_1 数据... → 返回
+
+    [执行 layer_1 的 Attention 计算]
+
+⑧  save_kv_layer('layer_1', ...)
+    └─ 异步发送 layer_1 的KV
+
+  --- Layer 2, 3 ... 同上 ---
+
+  [前向传播结束]
+
+⑨ wait_for_save()
+  └─ 等所有异步发送完成
+  └─ 确保远端收到完整的KV数据
+  └─ 返回
+
+⑩ clear_connector_metadata()
+  └─ self._connector_metadata = None
+  └─ 清理完毕，准备下一次前向
+
+═══════════════════════════════════════════════════════
+                  请求结束时 (SCHEDULER 侧)
+═══════════════════════════════════════════════════════
+
+[req_A 生成完毕]
+
+⑪ request_finished(req_A, block_ids=[block_0, block_1, block_2])
+  └─ 判断是否需要把这个请求的KV异步发给别的缓存节点
+  └─ 情况A: 不需要 → 返回 (False, None) → 立刻释放块
+  └─ 情况B: 需要  → 返回 (True, params) → 块暂不释放
+               → 后台异步发送KV
+               → 发完后 get_finished() 返回 req_A
+               → Scheduler 收到后才真正释放块
+```
+
+### 函数举例解析：
+#### get_num_new_matched_tokens
+```
+举例子：
+num_computed_tokens = 40
+offloaded_block_size = 32
+hits = 2
+→ 计算: 32*(1+2)-40 = 56
+→ 返回 (56, True)
+
+request.num_tokens = 96 (总token)
+offloaded_block_size = 32 (卸载块大小)
+num_computed_tokens = 40 (已计算token)
+hits = 2 (缓存命中2个连续块)
+
+GPU内存状态 (已计算token: 40):
+[■■■■■■■■■■■■■■■■] 卸载块0: token 0-31 (32t, 100%计算)
+[■■■■□□□□□□□□□□□□] 卸载块1: token 32-63 (8/32t计算，24t待计算)
+
+卸载存储中的命中块:（由于第0个卸载块完全计算，所以从第1个卸载块开始检查命中了多少个块，这里举例命中了2个块）
+[□□□□□□□□□□□□□□□□] 卸载块1剩余: token 40-63 (缓存命中)
+[□□□□□□□□□□□□□□□□] 卸载块2: token 64-95 (缓存命中)
+
+→ 可加载56个token (24+32)
+加载的时候是以token的每个layer粒度进行加载的，这里返回了token个数
+
+
+def get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
+
+        # 卸载块也是有单位的，这里的一个卸载块对应多个GPU块
+        # 计算请求总共需要多少个卸载块（不是GPU块）
+        num_blocks = request.num_tokens // self.offloaded_block_size # num_tokens ： 请求的总token数量
+
+        # block_size_factor：如果blocksize=16，offloaded_block_size=32，则block_size_factor为2
+        assert len(request.block_hashes) // self.block_size_factor == num_blocks
+        block_hashes = self._get_block_hashes(request)
+        # 预热
+        self.manager.touch(block_hashes)
+
+        full_block_tokens = self.offloaded_block_size * num_blocks
+
+        # 如果需要的token还不足一个卸载块的大小就不用搬运了
+        if full_block_tokens - num_computed_tokens < self.offloaded_block_size:
+            # we can load less than a block, skip
+            return 0, False
+        # 从已经计算的token的下一个token开始寻找可加载的块
+        start_block_idx = num_computed_tokens // self.offloaded_block_size
+
+        # 返回命中的连续块数
+        hits = self.manager.lookup(
+            self._get_block_hashes(request, start_idx=start_block_idx)
+        )
+        if hits is None:
+            # indicates a lookup that should be tried later
+            return None, False
+        if hits == 0:
+            return 0, False
+
+        num_hit_tokens = (
+            self.offloaded_block_size * (start_block_idx + hits) - num_computed_tokens
+        )
+        logger.debug(
+            'Request %s hit %s offloaded tokens after %s GPU hit tokens',
+            request.request_id,
+            num_hit_tokens,
+            num_computed_tokens,
+        )
+        if num_hit_tokens < self.offloaded_block_size:
+            return 0, False
+
+        if self._blocks_being_loaded:
+            block_hashes = self._get_block_hashes(
+                request, start_idx=start_block_idx, end_idx=start_block_idx + hits
+            )
+
+            if any(
+                block_hash in self._blocks_being_loaded for block_hash in block_hashes
+            ):
+                # hit blocks are being loaded, delay request
+                logger.debug(
+                    'Delaying request %s since some of its blocks are already'
+                    ' being loaded',
+                    request.request_id,
+                )
+                return None, False
+
+        return num_hit_tokens, True
+```
+
+
+
+## 加载
+Prefill阶段：计算prompt的完整KV缓存 → 需要卸载到远端。">
+<meta property="og:title" content="KV connector">
+<meta property="og:description" content="1. RequestA进入等待队列
+2. 调度器发现RequestA有远程KV → 设置为WAITING_FOR_REMOTE_KVS
+3. 启动异步传输，RequestA放入skipped队列
+4. 调度器处理RequestB、RequestC（不阻塞！）
+5. Worker异步传输KV缓存到本地
+6. 下一轮调度：检查RequestA传输状态
+7. 传输完成 → RequestA状态改为WAITING
+8. RequestA可以进行正常调度分配
+
+
+## 整体流程：
+可以先看一下waiting的代码；
+
+一个请求从sheduler侧开始：
+  **某schedule轮次**：先获取远端可传输的token --> 申请显存空间 --> 构造远端传输的元数据 --> 异步的话更改请求状态(end)
+  **某schedule轮次**：若请求状态为等待KV传输-->是否传输就绪-->是则为申请的显存缓存KV，并更改请求状态--〉调度（end）
+                                                                                                      -->否则让请求进入临时队列（end）
+
+**某update_from_output轮次**：（......）--》worker侧完成传输之后，将 KVconnector 中完成的请求放到 scheduler类中的 finished_recving_kv_req_ids 中
+**某schedule轮次**：_update_waiting_for_remote_kv 检查finished_recving_kv_req_ids远程传输KV请求是否就绪，若就绪更新分配block的元数据（**传输完成后则说明该KV已经分配到对应block当中了**）
+
+shceduler.py代码
+```
+        # Next, schedule the WAITING requests. ==========================================================
+        if not preempted_reqs:
+            while self.waiting and token_budget > 0:
+                if len(self.running) == self.max_num_running_reqs:
+                    break
+
+                request = self.waiting.peek_request()
+
+                # KVTransfer: skip request if still waiting for remote kvs.
+                if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    # 检查远程KV是否就绪，并存入分配的显存
+                    is_ready = self._update_waiting_for_remote_kv(request)
+                    if is_ready:
+                        if request.num_preemptions:
+                            # We must be loading for a resumed preemption
+                            # rather than a new request.
+                            request.status = RequestStatus.PREEMPTED
+                        else:
+                            request.status = RequestStatus.WAITING
+                    else:
+                        logger.debug(
+                            '%s is still in WAITING_FOR_REMOTE_KVS state.',
+                            request.request_id,
+                        )
+                        self.waiting.pop_request()
+                        # 这里放入了临时队列
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+                        # 然后在调度其他请求结束的时候，检查临时队列，将临时队列的req放到waitting队列
+
+                # Skip request if the structured output request is still waiting
+                # for FSM compilation.
+                if request.status == RequestStatus.WAITING_FOR_FSM:
+                    structured_output_req = request.structured_output_request
+                    if structured_output_req and structured_output_req.grammar:
+                        request.status = RequestStatus.WAITING
+                    else:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+
+                # Streaming: skip request if still waiting for next streaming req.
+                if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                    assert not request.streaming_queue
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+                # Check that adding the request still respects the max_loras
+                # constraint.
+                if (
+                    self.lora_config
+                    and request.lora_request
+                    and (
+                        len(scheduled_loras) == self.lora_config.max_loras
+                        and request.lora_request.lora_int_id not in scheduled_loras
+                    )
+                ):
+                    # Scheduling would exceed max_loras, skip.
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+                num_external_computed_tokens = 0
+                load_kv_async = False
+
+                # Get already-cached tokens.
+
+                # num_computed_tokens ==0 表示还没开始KV传输的相关计算
+                # 抢占KVcache会抢占整个请求的，不会只抢占单个请求的部分KV，
+                # 所以如果num_computed_tokens！=0，不需要connector加载远程KV
+                if request.num_computed_tokens == 0:
+                    # Get locally-cached tokens.
+                    new_computed_blocks, num_new_local_computed_tokens = (
+                        self.kv_cache_manager.get_computed_blocks(request)
+                    )
+
+                    # Get externally-cached tokens if using a KVConnector.
+                    # 通过connector获取远程可以加载多少个token的KVcache
+                    if self.connector is not None:
+                        # 通过connector获取远程是否有已经计算的token的KVcache
+                        ext_tokens, load_kv_async = (
+                            self.connector.get_num_new_matched_tokens(
+                                request, num_new_local_computed_tokens
+                            )
+                        )
+                        # 表示无法确定查询情况（不是为0），暂时不调度本请求，将本请求放入临时队列
+                        if ext_tokens is None:
+                            # The request cannot be scheduled because
+                            # the KVConnector couldn't determine
+                            # the number of matched tokens.
+                            self.waiting.pop_request()
+                            skipped_waiting_requests.prepend_request(request)
+                            continue
+
+                        request.num_external_computed_tokens = ext_tokens
+                        num_external_computed_tokens = ext_tokens
+
+                    # Total computed tokens (local + external).
+                    # 加载远程之后重新赋值num_computed_tokens
+                    num_computed_tokens = (
+                        num_new_local_computed_tokens + num_external_computed_tokens
+                    )
+                else:
+                    # KVTransfer: WAITING reqs have num_computed_tokens > 0
+                    # after async KV recvs are completed.
+                    # 在传输好KV之前就已经标记好了该请求的num_computed_tokens
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_new_local_computed_tokens = 0
+                    num_computed_tokens = request.num_computed_tokens
+
+                encoder_inputs_to_schedule = None
+                external_load_encoder_input = []
+                new_encoder_compute_budget = encoder_compute_budget
+
+                # 对于offloading connector，如果有命中远端KV，load_kv_async默认为异步，否则为同步
+
+                # 异步加载，加载本请求的KVcache同时处理其他请求
+                if load_kv_async:
+                    # KVTransfer: loading remote KV, do not allocate for new work.
+                    assert num_external_computed_tokens > 0
+                    # 这里不进行调度，只分配显存
+                    num_new_tokens = 0
+                    # 后面设置请求的状态为WAITING_FOR_REMOTE_KVS
+
+                # 同步加载，获取调度的token个数
+                else:
+                    # Number of tokens to be scheduled.
+                    # We use `request.num_tokens` instead of
+                    # `request.num_prompt_tokens` to consider the resumed
+                    # requests, which have output tokens.
+                    num_new_tokens = request.num_tokens - num_computed_tokens
+                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    if 0 < threshold < num_new_tokens:
+                        num_new_tokens = threshold
+
+                    # chunked prefill has to be enabled explicitly to allow
+                    # pooling requests to be chunked
+                    if (
+                        not self.scheduler_config.enable_chunked_prefill
+                        and num_new_tokens > token_budget
+                    ):
+                        # If chunked_prefill is disabled,
+                        # we can stop the scheduling here.
+                        break
+
+                    num_new_tokens = min(num_new_tokens, token_budget)
+                    assert num_new_tokens > 0
+
+                    # Schedule encoder inputs.
+                    if request.has_encoder_inputs:
+                        (
+                            encoder_inputs_to_schedule,
+                            num_new_tokens,
+                            new_encoder_compute_budget,
+                            external_load_encoder_input,
+                        ) = self._try_schedule_encoder_inputs(
+                            request,
+                            num_computed_tokens,
+                            num_new_tokens,
+                            encoder_compute_budget,
+                            shift_computed_tokens=1 if self.use_eagle else 0,
+                        )
+                        if num_new_tokens == 0:
+                            # The request cannot be scheduled.
+                            break
+
+                if self.need_mamba_block_aligned_split:
+                    num_new_tokens = self._mamba_block_aligned_split(
+                        request,
+                        num_new_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+                    if num_new_tokens == 0:
+                        break
+
+                # Handles an edge case when P/D Disaggregation
+                # is used with Spec Decoding where an
+                # extra block gets allocated which
+                # creates a mismatch between the number
+                # of local and remote blocks.
+                effective_lookahead_tokens = (
+                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                )
+
+                num_encoder_tokens = (
+                    self._num_encoder_max_input_tokens
+                    if self.is_encoder_decoder and request.has_encoder_inputs
+                    else 0
+                )
+                # 在本地申请新的KV cache的空间
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_new_tokens, # 总的token数量 - 已经计算KV的token数量
+                    num_new_computed_tokens=num_new_local_computed_tokens, # 本地的KVcache
+                    new_computed_blocks=new_computed_blocks,
+                    num_lookahead_tokens=effective_lookahead_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens, # 远程已经计算好的KVcache
+                    delay_cache_blocks=load_kv_async, # 这里应该是是否先延迟远端KVcache的加载
+                    num_encoder_tokens=num_encoder_tokens,
+                )
+
+                if new_blocks is None:
+                    # The request cannot be scheduled.
+
+                    # NOTE: we need to untouch the request from the encode cache
+                    # manager
+                    if request.has_encoder_inputs:
+                        self.encoder_cache_manager.free(request)
+                    break
+
+                # KVTransfer: the connector uses this info to determine
+                # if a load is needed. Note that
+                # This information is used to determine if a load is
+                # needed for this request.
+
+                # ========================================================================
+
+                # KVcache传输触发链路：
+                # scheduler端 在申请完显存之后，通过 update_state_after_alloc 将元数据传输到worker侧
+                # Worker端    持续监听传输队列，执行传输，并更新scheduler端的请求状态
+                # scheduler端 _update_waiting_for_remote_kv 检查远程KV是否就绪，若就绪则存入分配好的显存
+                
+                # ========================================================================
+
+                if self.connector is not None:
+                    # connector更新request的block，远端的KVcache加载的 Metadata
+                    self.connector.update_state_after_alloc(   # 如果传输完成，update_state_after_alloc函数会直接返回
+                        request,
+                        self.kv_cache_manager.get_blocks(request.request_id),
+                        num_external_computed_tokens,
+                    )
+
+                # Request was already popped from self.waiting
+                # unless it was re-added above due to new_blocks being None.
+                request = self.waiting.pop_request()
+
+                # 如果是异步的话，更改请求的状态为WAITING_FOR_REMOTE_KVS，不进行调度，添加到临时队列中
+                if load_kv_async:
+                    # 如果请求远程KV传输完成，
+                    # If loading async, allocate memory and put request
+                    # into the WAITING_FOR_REMOTE_KV state.
+                    skipped_waiting_requests.prepend_request(request)
+                    # 将该请求标记为异步加载远端KV状态
+                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    continue   # 异步到此end
+
+                # 如果是非异步的话，直接可以进行推理了，在执行模型前向的时候，在进行每个layer的attn计算之前等待加载完成
+
+                self._update_connector_prefix_cache_stats(request)
+
+                # 进行调度，添加到running队列中
+                self.running.append(request)
+                if self.log_stats:
+                    request.record_event(
+                        EngineCoreEventType.SCHEDULED, scheduled_timestamp
+                    )
+                if request.status == RequestStatus.WAITING:
+                    scheduled_new_reqs.append(request)
+                elif request.status == RequestStatus.PREEMPTED:
+                    scheduled_resumed_reqs.append(request)
+                else:
+                    raise RuntimeError(f'Invalid request status: {request.status}')
+
+                if self.lora_config and request.lora_request:
+                    scheduled_loras.add(request.lora_request.lora_int_id)
+                # 获取该请求的kv block信息
+                req_to_new_blocks[request.request_id] = (
+                    self.kv_cache_manager.get_blocks(request.request_id)
+                )
+                # 记录调度的token数量，缩减token_budget
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                request.status = RequestStatus.RUNNING
+                request.num_computed_tokens = num_computed_tokens
+                # Count the number of prefix cached tokens.
+                if request.num_cached_tokens < 0:
+                    request.num_cached_tokens = num_computed_tokens
+
+```
+
+
+**scheduler**端调用build_connector_meta()
+构建需要传输的请求元数据（包括块ID、请求ID、token数量）
+返回KVConnectorMetadata对象
+
+worker侧的gpu.model_runner在前向计算之前执行：
+```
+        # Run model.
+        if use_cudagraph:
+            # Run CUDA graph.
+            # NOTE(woosuk): Here, we don't need to pass the input tensors,
+            # because they are already copied to the CUDA graph input buffers.
+
+            # 绑定metadata，开始KV传输
+            self.kv_connector.pre_forward(scheduler_output)
+
+            # 请求分为KV传输与非KV传输的
+            # 对于KV传输的请求，根据connector类型，决定是否异步加载
+            #   若为异步传输：scheduler侧会将该请求的 num_new_tokens = 0,该请求本次不会进行前向计算
+            #   若为同步传输：num_new_tokens正常计算，通过layer by layer进行前向计算
+            # 对于非KV传输的请求：直接进行前向计算
+
+            # 用cuda graph方式进行前向计算
+            hidden_states = self.cudagraph_manager.run(
+                input_batch.num_tokens_after_padding
+            )
+        else:
+            .......
+
+        # 前向执行完毕之后，
+        kv_connector_output = self.kv_connector.post_forward(scheduler_output)   # 
+        self.execute_model_state = hidden_states, input_batch, kv_connector_output
+        return None
+```
+
+**worker**端接收到scheduler_output后：
+提取kv_connector_metadata
+调用bind_connector_metadata()绑定元数据
+调用start_load_kv()开始异步加载
+模型前向执行完毕之后调用self.kv_connector.post_forward(scheduler_output)
+post_forward调用链路：
+│    └── post_forward()      # 获取传输完成的请求 ID                                                    
+│          │                                                                    
+│         ├ ── get_finished()                                                   
+│          │     └── OffloadingConnectorWorker.get_finished()   # 检查所有传输任务是否完成
+│          │           └── OffloadingWorker.get_finished() 【offloading_connector.py】
+│          │                 └── SingleDirectionOffloadingHandler.get_finished()【cpu_gpu.py】     # 返回完成的 job_id     
+│          │                       └── event.query() 检查传输完成              
+                  
+
+## 举例：
+Scheduler端：
+1. 请求A分配blocks [4,5,6], 需要传输35个token
+2. 构建ReqMeta(request_id='A', block_ids=[4,5,6], num_tokens=35)
+3. 放入P2pNcclConnectorMetadata.requests列表
+
+Worker端：
+1. 解析metadata获取blocks [4,5,6]
+2. 启动异步DMA传输：
+   - block4: tokens 0-15
+   - block5: tokens 16-31 
+   - block6: tokens 32-34 (最后3个token)
+3. 传输完成后标记请求A为可调度状态
+
+注意点：
+如果已经通过connector计算好外部token数量等信息，就直接给num_computed_token赋值了，虽说还没加载完成；
+
+对比：
+不使用OffloadingConnector：
+```
+# 调用链
+用户 -> vllm.LLM.genreate()           # 入口
+      -> vllm/v1/engine.py           # 引擎
+      -> vllm/v1/core/sched/scheduler.py  # 基础调度
+      -> vllm/v1/worker/model_runner.py   # 模型执行
+      -> vllm/attention/layers/*.py  # 注意力计算
+```
+使用OffloadingConnector：
+```
+# 调用链（扩展）
+用户 -> vllm.LLM.generate()          # 入口
+      -> vllm/v1/engine.py           # 引擎（检测KVTransferConfig）
+      -> vllm/v1/core/sched/scheduler.py  # 调度+Connector决策
+           ↳ vllm/distributed/kv_transfer/kv_connector/factory.py
+           ↳ vllm/v1/kv_offload/factory.py
+           ↳ vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+           ↳ vllm/v1/kv_offload/arc_manager.py
+      
+      -> vllm/v1/worker/model_runner.py   # 执行+传输
+           ↳ vllm/v1/worker/kv_connector_model_runner_mixin.py
+           
+      -> vllm/attention/layers/*.py  # 注意力计算+传输同步
+           ↳ vllm/attention/utils/kv_transfer_utils.py
+```
+
+
+connector维护了两个role：scheduler和worker
+
+这两个role对应的方法可以被vllm中对应的结构进行调用
+
+## scheduler
+场景设定
+用户请求：prompt = '北京是中国的首都，它的人口是'  (10个token)
+远端 Prefill 机器 已经算过这个 prompt 的前8个token的 KV Cache
+本地 已经缓存了前3个token的 KV Cache
+**get_num_new_matched_tokens()**
+**update_state_after_alloc()**
+**build_connector_meta()**
+
+```
+Scheduler Step:
+
+  [新请求 req_A 进来]
+       ↓
+  get_num_new_matched_tokens(req_A, num_computed=3)
+  → 返回 (5, True)  '远端有5个token可以给你'
+       ↓
+  KVCacheManager 分配 block_0, block_1 给这5个token
+       ↓
+  update_state_after_alloc(req_A, blocks, num_external=5)
+  → Connector 内部记录: 'block_0,1 要从远端拉数据'
+       ↓
+  ... 处理其他请求 ...
+       ↓
+  build_connector_meta(scheduler_output)
+  → 把所有请求的传输任务打包成 metadata
+  → 清空内部状态
+  → 返回 meta
+       ↓
+  meta 被发送到 Worker 进程
+       ↓
+  Worker: start_load_kv() 根据 meta 真正开始传数据
+```
+
+## worker
+```
+═══════════════════════════════════════════════════════
+                    WORKER 侧
+═══════════════════════════════════════════════════════
+
+⑤ bind_connector_metadata(meta)
+  └─ self._connector_metadata = meta
+  └─ Worker 现在知道要干什么了
+
+⑥ start_load_kv(forward_context)
+  └─ 读取 meta: req_A 需要从 10.0.0.1 拉 block_0, block_1
+  └─ 后台线程异步开始拉数据
+  └─ 立刻返回，开始前向传播
+
+  [前向传播开始，逐层执行]
+
+  --- Layer 0 ---
+⑦  wait_for_layer_load('layer_0')
+    └─ 等待 layer_0 的KV数据到达（可能短暂阻塞）
+    └─ 数据到了 → 返回
+
+    [执行 layer_0 的 Attention 计算]
+    output_0 = attention_0(input, kv_cache[layer_0])
+
+⑧  save_kv_layer('layer_0', kv_cache['layer_0'], attn_meta)
+    └─ 提取 req_B 对应的KV数据
+    └─ 放入发送队列，异步发送给 10.0.0.2
+    └─ 立刻返回
+
+  --- Layer 1 ---
+⑦  wait_for_layer_load('layer_1')
+    └─ 等 layer_1 数据... → 返回
+
+    [执行 layer_1 的 Attention 计算]
+
+⑧  save_kv_layer('layer_1', ...)
+    └─ 异步发送 layer_1 的KV
+
+  --- Layer 2, 3 ... 同上 ---
+
+  [前向传播结束]
+
+⑨ wait_for_save()
+  └─ 等所有异步发送完成
+  └─ 确保远端收到完整的KV数据
+  └─ 返回
+
+⑩ clear_connector_metadata()
+  └─ self._connector_metadata = None
+  └─ 清理完毕，准备下一次前向
+
+═══════════════════════════════════════════════════════
+                  请求结束时 (SCHEDULER 侧)
+═══════════════════════════════════════════════════════
+
+[req_A 生成完毕]
+
+⑪ request_finished(req_A, block_ids=[block_0, block_1, block_2])
+  └─ 判断是否需要把这个请求的KV异步发给别的缓存节点
+  └─ 情况A: 不需要 → 返回 (False, None) → 立刻释放块
+  └─ 情况B: 需要  → 返回 (True, params) → 块暂不释放
+               → 后台异步发送KV
+               → 发完后 get_finished() 返回 req_A
+               → Scheduler 收到后才真正释放块
+```
+
+### 函数举例解析：
+#### get_num_new_matched_tokens
+```
+举例子：
+num_computed_tokens = 40
+offloaded_block_size = 32
+hits = 2
+→ 计算: 32*(1+2)-40 = 56
+→ 返回 (56, True)
+
+request.num_tokens = 96 (总token)
+offloaded_block_size = 32 (卸载块大小)
+num_computed_tokens = 40 (已计算token)
+hits = 2 (缓存命中2个连续块)
+
+GPU内存状态 (已计算token: 40):
+[■■■■■■■■■■■■■■■■] 卸载块0: token 0-31 (32t, 100%计算)
+[■■■■□□□□□□□□□□□□] 卸载块1: token 32-63 (8/32t计算，24t待计算)
+
+卸载存储中的命中块:（由于第0个卸载块完全计算，所以从第1个卸载块开始检查命中了多少个块，这里举例命中了2个块）
+[□□□□□□□□□□□□□□□□] 卸载块1剩余: token 40-63 (缓存命中)
+[□□□□□□□□□□□□□□□□] 卸载块2: token 64-95 (缓存命中)
+
+→ 可加载56个token (24+32)
+加载的时候是以token的每个layer粒度进行加载的，这里返回了token个数
+
+
+def get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
+
+        # 卸载块也是有单位的，这里的一个卸载块对应多个GPU块
+        # 计算请求总共需要多少个卸载块（不是GPU块）
+        num_blocks = request.num_tokens // self.offloaded_block_size # num_tokens ： 请求的总token数量
+
+        # block_size_factor：如果blocksize=16，offloaded_block_size=32，则block_size_factor为2
+        assert len(request.block_hashes) // self.block_size_factor == num_blocks
+        block_hashes = self._get_block_hashes(request)
+        # 预热
+        self.manager.touch(block_hashes)
+
+        full_block_tokens = self.offloaded_block_size * num_blocks
+
+        # 如果需要的token还不足一个卸载块的大小就不用搬运了
+        if full_block_tokens - num_computed_tokens < self.offloaded_block_size:
+            # we can load less than a block, skip
+            return 0, False
+        # 从已经计算的token的下一个token开始寻找可加载的块
+        start_block_idx = num_computed_tokens // self.offloaded_block_size
+
+        # 返回命中的连续块数
+        hits = self.manager.lookup(
+            self._get_block_hashes(request, start_idx=start_block_idx)
+        )
+        if hits is None:
+            # indicates a lookup that should be tried later
+            return None, False
+        if hits == 0:
+            return 0, False
+
+        num_hit_tokens = (
+            self.offloaded_block_size * (start_block_idx + hits) - num_computed_tokens
+        )
+        logger.debug(
+            'Request %s hit %s offloaded tokens after %s GPU hit tokens',
+            request.request_id,
+            num_hit_tokens,
+            num_computed_tokens,
+        )
+        if num_hit_tokens < self.offloaded_block_size:
+            return 0, False
+
+        if self._blocks_being_loaded:
+            block_hashes = self._get_block_hashes(
+                request, start_idx=start_block_idx, end_idx=start_block_idx + hits
+            )
+
+            if any(
+                block_hash in self._blocks_being_loaded for block_hash in block_hashes
+            ):
+                # hit blocks are being loaded, delay request
+                logger.debug(
+                    'Delaying request %s since some of its blocks are already'
+                    ' being loaded',
+                    request.request_id,
+                )
+                return None, False
+
+        return num_hit_tokens, True
+```
+
+
+
+## 加载
+Prefill阶段：计算prompt的完整KV缓存 → 需要卸载到远端。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://xx2565.github.io/Inkwell/post/KV%20connector.html">
+<meta property="og:image" content="https://github.githubassets.com/favicons/favicon.svg">
+<title>KV connector</title>
+
+
+
+</head>
+<style>
+body{box-sizing: border-box;min-width: 200px;max-width: 900px;margin: 20px auto;padding: 45px;font-size: 16px;font-family: sans-serif;line-height: 1.25;}
+#header{display:flex;padding-bottom:8px;border-bottom: 1px solid var(--borderColor-muted, var(--color-border-muted));margin-bottom: 16px;}
+#footer {margin-top:64px; text-align: center;font-size: small;}
+
+</style>
+
+<style>
+.postTitle{margin: auto 0;font-size:40px;font-weight:bold;}
+.title-right{display:flex;margin:auto 0 0 auto;}
+.title-right .circle{padding: 14px 16px;margin-right:8px;}
+#postBody{border-bottom: 1px solid var(--color-border-default);padding-bottom:36px;}
+#postBody hr{height:2px;}
+#cmButton{height:48px;margin-top:48px;}
+#comments{margin-top:64px;}
+.g-emoji{font-size:24px;}
+@media (max-width: 600px) {
+    body {padding: 8px;}
+    .postTitle{font-size:24px;}
+}
+.copy-feedback {
+    display: none;
+    position: absolute;
+    top: 10px;
+    right: 50px;
+    color: var(--color-fg-on-emphasis);
+    background-color: var(--color-fg-muted);
+    border-radius: 3px;
+    padding: 5px 8px;
+    font-size: 12px;
+}
+</style>
+
+
+
+
+<body>
+    <div id="header">
+<h1 class="postTitle">KV connector</h1>
+<div class="title-right">
+    <a href="https://xx2565.github.io/Inkwell" id="buttonHome" class="btn btn-invisible circle" title="首页">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathHome" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+    <a href="https://github.com/xx2565/Inkwell/issues/4" target="_blank" class="btn btn-invisible circle" title="Issue">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathIssue" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+
+    <a class="btn btn-invisible circle" onclick="modeSwitch();" title="切换主题">
+        <svg class="octicon" width="16" height="16" >
+            <path id="themeSwitch" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+
+</div>
+</div>
+    <div id="content">
+<div class="markdown-body" id="postBody"><ol>
+<li>RequestA进入等待队列</li>
+<li>调度器发现RequestA有远程KV → 设置为WAITING_FOR_REMOTE_KVS</li>
+<li>启动异步传输，RequestA放入skipped队列</li>
+<li>调度器处理RequestB、RequestC（不阻塞！）</li>
+<li>Worker异步传输KV缓存到本地</li>
+<li>下一轮调度：检查RequestA传输状态</li>
+<li>传输完成 → RequestA状态改为WAITING</li>
+<li>RequestA可以进行正常调度分配</li>
+</ol>
+<h2>整体流程：</h2>
+<p>可以先看一下waiting的代码；</p>
+<p>一个请求从sheduler侧开始：<br>
+<strong>某schedule轮次</strong>：先获取远端可传输的token --&gt; 申请显存空间 --&gt; 构造远端传输的元数据 --&gt; 异步的话更改请求状态(end)<br>
+<strong>某schedule轮次</strong>：若请求状态为等待KV传输--&gt;是否传输就绪--&gt;是则为申请的显存缓存KV，并更改请求状态--〉调度（end）<br>
+--&gt;否则让请求进入临时队列（end）</p>
+<p><strong>某update_from_output轮次</strong>：（......）--》worker侧完成传输之后，将 KVconnector 中完成的请求放到 scheduler类中的 finished_recving_kv_req_ids 中<br>
+<strong>某schedule轮次</strong>：_update_waiting_for_remote_kv 检查finished_recving_kv_req_ids远程传输KV请求是否就绪，若就绪更新分配block的元数据（<strong>传输完成后则说明该KV已经分配到对应block当中了</strong>）</p>
+<p>shceduler.py代码</p>
+<pre class="notranslate"><code class="notranslate">        # Next, schedule the WAITING requests. ==========================================================
+        if not preempted_reqs:
+            while self.waiting and token_budget &gt; 0:
+                if len(self.running) == self.max_num_running_reqs:
+                    break
+
+                request = self.waiting.peek_request()
+
+                # KVTransfer: skip request if still waiting for remote kvs.
+                if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    # 检查远程KV是否就绪，并存入分配的显存
+                    is_ready = self._update_waiting_for_remote_kv(request)
+                    if is_ready:
+                        if request.num_preemptions:
+                            # We must be loading for a resumed preemption
+                            # rather than a new request.
+                            request.status = RequestStatus.PREEMPTED
+                        else:
+                            request.status = RequestStatus.WAITING
+                    else:
+                        logger.debug(
+                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
+                            request.request_id,
+                        )
+                        self.waiting.pop_request()
+                        # 这里放入了临时队列
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+                        # 然后在调度其他请求结束的时候，检查临时队列，将临时队列的req放到waitting队列
+
+                # Skip request if the structured output request is still waiting
+                # for FSM compilation.
+                if request.status == RequestStatus.WAITING_FOR_FSM:
+                    structured_output_req = request.structured_output_request
+                    if structured_output_req and structured_output_req.grammar:
+                        request.status = RequestStatus.WAITING
+                    else:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+
+                # Streaming: skip request if still waiting for next streaming req.
+                if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                    assert not request.streaming_queue
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+                # Check that adding the request still respects the max_loras
+                # constraint.
+                if (
+                    self.lora_config
+                    and request.lora_request
+                    and (
+                        len(scheduled_loras) == self.lora_config.max_loras
+                        and request.lora_request.lora_int_id not in scheduled_loras
+                    )
+                ):
+                    # Scheduling would exceed max_loras, skip.
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+                num_external_computed_tokens = 0
+                load_kv_async = False
+
+                # Get already-cached tokens.
+
+                # num_computed_tokens ==0 表示还没开始KV传输的相关计算
+                # 抢占KVcache会抢占整个请求的，不会只抢占单个请求的部分KV，
+                # 所以如果num_computed_tokens！=0，不需要connector加载远程KV
+                if request.num_computed_tokens == 0:
+                    # Get locally-cached tokens.
+                    new_computed_blocks, num_new_local_computed_tokens = (
+                        self.kv_cache_manager.get_computed_blocks(request)
+                    )
+
+                    # Get externally-cached tokens if using a KVConnector.
+                    # 通过connector获取远程可以加载多少个token的KVcache
+                    if self.connector is not None:
+                        # 通过connector获取远程是否有已经计算的token的KVcache
+                        ext_tokens, load_kv_async = (
+                            self.connector.get_num_new_matched_tokens(
+                                request, num_new_local_computed_tokens
+                            )
+                        )
+                        # 表示无法确定查询情况（不是为0），暂时不调度本请求，将本请求放入临时队列
+                        if ext_tokens is None:
+                            # The request cannot be scheduled because
+                            # the KVConnector couldn't determine
+                            # the number of matched tokens.
+                            self.waiting.pop_request()
+                            skipped_waiting_requests.prepend_request(request)
+                            continue
+
+                        request.num_external_computed_tokens = ext_tokens
+                        num_external_computed_tokens = ext_tokens
+
+                    # Total computed tokens (local + external).
+                    # 加载远程之后重新赋值num_computed_tokens
+                    num_computed_tokens = (
+                        num_new_local_computed_tokens + num_external_computed_tokens
+                    )
+                else:
+                    # KVTransfer: WAITING reqs have num_computed_tokens &gt; 0
+                    # after async KV recvs are completed.
+                    # 在传输好KV之前就已经标记好了该请求的num_computed_tokens
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_new_local_computed_tokens = 0
+                    num_computed_tokens = request.num_computed_tokens
+
+                encoder_inputs_to_schedule = None
+                external_load_encoder_input = []
+                new_encoder_compute_budget = encoder_compute_budget
+
+                # 对于offloading connector，如果有命中远端KV，load_kv_async默认为异步，否则为同步
+
+                # 异步加载，加载本请求的KVcache同时处理其他请求
+                if load_kv_async:
+                    # KVTransfer: loading remote KV, do not allocate for new work.
+                    assert num_external_computed_tokens &gt; 0
+                    # 这里不进行调度，只分配显存
+                    num_new_tokens = 0
+                    # 后面设置请求的状态为WAITING_FOR_REMOTE_KVS
+
+                # 同步加载，获取调度的token个数
+                else:
+                    # Number of tokens to be scheduled.
+                    # We use `request.num_tokens` instead of
+                    # `request.num_prompt_tokens` to consider the resumed
+                    # requests, which have output tokens.
+                    num_new_tokens = request.num_tokens - num_computed_tokens
+                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    if 0 &lt; threshold &lt; num_new_tokens:
+                        num_new_tokens = threshold
+
+                    # chunked prefill has to be enabled explicitly to allow
+                    # pooling requests to be chunked
+                    if (
+                        not self.scheduler_config.enable_chunked_prefill
+                        and num_new_tokens &gt; token_budget
+                    ):
+                        # If chunked_prefill is disabled,
+                        # we can stop the scheduling here.
+                        break
+
+                    num_new_tokens = min(num_new_tokens, token_budget)
+                    assert num_new_tokens &gt; 0
+
+                    # Schedule encoder inputs.
+                    if request.has_encoder_inputs:
+                        (
+                            encoder_inputs_to_schedule,
+                            num_new_tokens,
+                            new_encoder_compute_budget,
+                            external_load_encoder_input,
+                        ) = self._try_schedule_encoder_inputs(
+                            request,
+                            num_computed_tokens,
+                            num_new_tokens,
+                            encoder_compute_budget,
+                            shift_computed_tokens=1 if self.use_eagle else 0,
+                        )
+                        if num_new_tokens == 0:
+                            # The request cannot be scheduled.
+                            break
+
+                if self.need_mamba_block_aligned_split:
+                    num_new_tokens = self._mamba_block_aligned_split(
+                        request,
+                        num_new_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+                    if num_new_tokens == 0:
+                        break
+
+                # Handles an edge case when P/D Disaggregation
+                # is used with Spec Decoding where an
+                # extra block gets allocated which
+                # creates a mismatch between the number
+                # of local and remote blocks.
+                effective_lookahead_tokens = (
+                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                )
+
+                num_encoder_tokens = (
+                    self._num_encoder_max_input_tokens
+                    if self.is_encoder_decoder and request.has_encoder_inputs
+                    else 0
+                )
+                # 在本地申请新的KV cache的空间
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_new_tokens, # 总的token数量 - 已经计算KV的token数量
+                    num_new_computed_tokens=num_new_local_computed_tokens, # 本地的KVcache
+                    new_computed_blocks=new_computed_blocks,
+                    num_lookahead_tokens=effective_lookahead_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens, # 远程已经计算好的KVcache
+                    delay_cache_blocks=load_kv_async, # 这里应该是是否先延迟远端KVcache的加载
+                    num_encoder_tokens=num_encoder_tokens,
+                )
+
+                if new_blocks is None:
+                    # The request cannot be scheduled.
+
+                    # NOTE: we need to untouch the request from the encode cache
+                    # manager
+                    if request.has_encoder_inputs:
+                        self.encoder_cache_manager.free(request)
+                    break
+
+                # KVTransfer: the connector uses this info to determine
+                # if a load is needed. Note that
+                # This information is used to determine if a load is
+                # needed for this request.
+
+                # ========================================================================
+
+                # KVcache传输触发链路：
+                # scheduler端 在申请完显存之后，通过 update_state_after_alloc 将元数据传输到worker侧
+                # Worker端    持续监听传输队列，执行传输，并更新scheduler端的请求状态
+                # scheduler端 _update_waiting_for_remote_kv 检查远程KV是否就绪，若就绪则存入分配好的显存
+                
+                # ========================================================================
+
+                if self.connector is not None:
+                    # connector更新request的block，远端的KVcache加载的 Metadata
+                    self.connector.update_state_after_alloc(   # 如果传输完成，update_state_after_alloc函数会直接返回
+                        request,
+                        self.kv_cache_manager.get_blocks(request.request_id),
+                        num_external_computed_tokens,
+                    )
+
+                # Request was already popped from self.waiting
+                # unless it was re-added above due to new_blocks being None.
+                request = self.waiting.pop_request()
+
+                # 如果是异步的话，更改请求的状态为WAITING_FOR_REMOTE_KVS，不进行调度，添加到临时队列中
+                if load_kv_async:
+                    # 如果请求远程KV传输完成，
+                    # If loading async, allocate memory and put request
+                    # into the WAITING_FOR_REMOTE_KV state.
+                    skipped_waiting_requests.prepend_request(request)
+                    # 将该请求标记为异步加载远端KV状态
+                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    continue   # 异步到此end
+
+                # 如果是非异步的话，直接可以进行推理了，在执行模型前向的时候，在进行每个layer的attn计算之前等待加载完成
+
+                self._update_connector_prefix_cache_stats(request)
+
+                # 进行调度，添加到running队列中
+                self.running.append(request)
+                if self.log_stats:
+                    request.record_event(
+                        EngineCoreEventType.SCHEDULED, scheduled_timestamp
+                    )
+                if request.status == RequestStatus.WAITING:
+                    scheduled_new_reqs.append(request)
+                elif request.status == RequestStatus.PREEMPTED:
+                    scheduled_resumed_reqs.append(request)
+                else:
+                    raise RuntimeError(f"Invalid request status: {request.status}")
+
+                if self.lora_config and request.lora_request:
+                    scheduled_loras.add(request.lora_request.lora_int_id)
+                # 获取该请求的kv block信息
+                req_to_new_blocks[request.request_id] = (
+                    self.kv_cache_manager.get_blocks(request.request_id)
+                )
+                # 记录调度的token数量，缩减token_budget
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                request.status = RequestStatus.RUNNING
+                request.num_computed_tokens = num_computed_tokens
+                # Count the number of prefix cached tokens.
+                if request.num_cached_tokens &lt; 0:
+                    request.num_cached_tokens = num_computed_tokens
+
+</code></pre>
+<p><strong>scheduler</strong>端调用build_connector_meta()<br>
+构建需要传输的请求元数据（包括块ID、请求ID、token数量）<br>
+返回KVConnectorMetadata对象</p>
+<p>worker侧的gpu.model_runner在前向计算之前执行：</p>
+<pre class="notranslate"><code class="notranslate">        # Run model.
+        if use_cudagraph:
+            # Run CUDA graph.
+            # NOTE(woosuk): Here, we don't need to pass the input tensors,
+            # because they are already copied to the CUDA graph input buffers.
+
+            # 绑定metadata，开始KV传输
+            self.kv_connector.pre_forward(scheduler_output)
+
+            # 请求分为KV传输与非KV传输的
+            # 对于KV传输的请求，根据connector类型，决定是否异步加载
+            #   若为异步传输：scheduler侧会将该请求的 num_new_tokens = 0,该请求本次不会进行前向计算
+            #   若为同步传输：num_new_tokens正常计算，通过layer by layer进行前向计算
+            # 对于非KV传输的请求：直接进行前向计算
+
+            # 用cuda graph方式进行前向计算
+            hidden_states = self.cudagraph_manager.run(
+                input_batch.num_tokens_after_padding
+            )
+        else:
+            .......
+
+        # 前向执行完毕之后，
+        kv_connector_output = self.kv_connector.post_forward(scheduler_output)   # 
+        self.execute_model_state = hidden_states, input_batch, kv_connector_output
+        return None
+</code></pre>
+<p><strong>worker</strong>端接收到scheduler_output后：<br>
+提取kv_connector_metadata<br>
+调用bind_connector_metadata()绑定元数据<br>
+调用start_load_kv()开始异步加载<br>
+模型前向执行完毕之后调用self.kv_connector.post_forward(scheduler_output)<br>
+post_forward调用链路：<br>
+│    └── post_forward()      # 获取传输完成的请求 ID<br>
+│          │<br>
+│         ├ ── get_finished()<br>
+│          │     └── OffloadingConnectorWorker.get_finished()   # 检查所有传输任务是否完成<br>
+│          │           └── OffloadingWorker.get_finished() 【offloading_connector.py】<br>
+│          │                 └── SingleDirectionOffloadingHandler.get_finished()【cpu_gpu.py】     # 返回完成的 job_id<br>
+│          │                       └── event.query() 检查传输完成</p>
+<h2>举例：</h2>
+<p>Scheduler端：</p>
+<ol>
+<li>请求A分配blocks [4,5,6], 需要传输35个token</li>
+<li>构建ReqMeta(request_id="A", block_ids=[4,5,6], num_tokens=35)</li>
+<li>放入P2pNcclConnectorMetadata.requests列表</li>
+</ol>
+<p>Worker端：</p>
+<ol>
+<li>解析metadata获取blocks [4,5,6]</li>
+<li>启动异步DMA传输：
+<ul>
+<li>block4: tokens 0-15</li>
+<li>block5: tokens 16-31</li>
+<li>block6: tokens 32-34 (最后3个token)</li>
+</ul>
+</li>
+<li>传输完成后标记请求A为可调度状态</li>
+</ol>
+<p>注意点：<br>
+如果已经通过connector计算好外部token数量等信息，就直接给num_computed_token赋值了，虽说还没加载完成；</p>
+<p>对比：<br>
+不使用OffloadingConnector：</p>
+<pre class="notranslate"><code class="notranslate"># 调用链
+用户 -&gt; vllm.LLM.genreate()           # 入口
+      -&gt; vllm/v1/engine.py           # 引擎
+      -&gt; vllm/v1/core/sched/scheduler.py  # 基础调度
+      -&gt; vllm/v1/worker/model_runner.py   # 模型执行
+      -&gt; vllm/attention/layers/*.py  # 注意力计算
+</code></pre>
+<p>使用OffloadingConnector：</p>
+<pre class="notranslate"><code class="notranslate"># 调用链（扩展）
+用户 -&gt; vllm.LLM.generate()          # 入口
+      -&gt; vllm/v1/engine.py           # 引擎（检测KVTransferConfig）
+      -&gt; vllm/v1/core/sched/scheduler.py  # 调度+Connector决策
+           ↳ vllm/distributed/kv_transfer/kv_connector/factory.py
+           ↳ vllm/v1/kv_offload/factory.py
+           ↳ vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+           ↳ vllm/v1/kv_offload/arc_manager.py
+      
+      -&gt; vllm/v1/worker/model_runner.py   # 执行+传输
+           ↳ vllm/v1/worker/kv_connector_model_runner_mixin.py
+           
+      -&gt; vllm/attention/layers/*.py  # 注意力计算+传输同步
+           ↳ vllm/attention/utils/kv_transfer_utils.py
+</code></pre>
+<p>connector维护了两个role：scheduler和worker</p>
+<p>这两个role对应的方法可以被vllm中对应的结构进行调用</p>
+<h2>scheduler</h2>
+<p>场景设定<br>
+用户请求：prompt = "北京是中国的首都，它的人口是"  (10个token)<br>
+远端 Prefill 机器 已经算过这个 prompt 的前8个token的 KV Cache<br>
+本地 已经缓存了前3个token的 KV Cache<br>
+<strong>get_num_new_matched_tokens()</strong><br>
+<strong>update_state_after_alloc()</strong><br>
+<strong>build_connector_meta()</strong></p>
+<pre class="notranslate"><code class="notranslate">Scheduler Step:
+
+  [新请求 req_A 进来]
+       ↓
+  get_num_new_matched_tokens(req_A, num_computed=3)
+  → 返回 (5, True)  "远端有5个token可以给你"
+       ↓
+  KVCacheManager 分配 block_0, block_1 给这5个token
+       ↓
+  update_state_after_alloc(req_A, blocks, num_external=5)
+  → Connector 内部记录: "block_0,1 要从远端拉数据"
+       ↓
+  ... 处理其他请求 ...
+       ↓
+  build_connector_meta(scheduler_output)
+  → 把所有请求的传输任务打包成 metadata
+  → 清空内部状态
+  → 返回 meta
+       ↓
+  meta 被发送到 Worker 进程
+       ↓
+  Worker: start_load_kv() 根据 meta 真正开始传数据
+</code></pre>
+<h2>worker</h2>
+<pre class="notranslate"><code class="notranslate">═══════════════════════════════════════════════════════
+                    WORKER 侧
+═══════════════════════════════════════════════════════
+
+⑤ bind_connector_metadata(meta)
+  └─ self._connector_metadata = meta
+  └─ Worker 现在知道要干什么了
+
+⑥ start_load_kv(forward_context)
+  └─ 读取 meta: req_A 需要从 10.0.0.1 拉 block_0, block_1
+  └─ 后台线程异步开始拉数据
+  └─ 立刻返回，开始前向传播
+
+  [前向传播开始，逐层执行]
+
+  --- Layer 0 ---
+⑦  wait_for_layer_load("layer_0")
+    └─ 等待 layer_0 的KV数据到达（可能短暂阻塞）
+    └─ 数据到了 → 返回
+
+    [执行 layer_0 的 Attention 计算]
+    output_0 = attention_0(input, kv_cache[layer_0])
+
+⑧  save_kv_layer("layer_0", kv_cache["layer_0"], attn_meta)
+    └─ 提取 req_B 对应的KV数据
+    └─ 放入发送队列，异步发送给 10.0.0.2
+    └─ 立刻返回
+
+  --- Layer 1 ---
+⑦  wait_for_layer_load("layer_1")
+    └─ 等 layer_1 数据... → 返回
+
+    [执行 layer_1 的 Attention 计算]
+
+⑧  save_kv_layer("layer_1", ...)
+    └─ 异步发送 layer_1 的KV
+
+  --- Layer 2, 3 ... 同上 ---
+
+  [前向传播结束]
+
+⑨ wait_for_save()
+  └─ 等所有异步发送完成
+  └─ 确保远端收到完整的KV数据
+  └─ 返回
+
+⑩ clear_connector_metadata()
+  └─ self._connector_metadata = None
+  └─ 清理完毕，准备下一次前向
+
+═══════════════════════════════════════════════════════
+                  请求结束时 (SCHEDULER 侧)
+═══════════════════════════════════════════════════════
+
+[req_A 生成完毕]
+
+⑪ request_finished(req_A, block_ids=[block_0, block_1, block_2])
+  └─ 判断是否需要把这个请求的KV异步发给别的缓存节点
+  └─ 情况A: 不需要 → 返回 (False, None) → 立刻释放块
+  └─ 情况B: 需要  → 返回 (True, params) → 块暂不释放
+               → 后台异步发送KV
+               → 发完后 get_finished() 返回 req_A
+               → Scheduler 收到后才真正释放块
+</code></pre>
+<h3>函数举例解析：</h3>
+<h4>get_num_new_matched_tokens</h4>
+<pre class="notranslate"><code class="notranslate">举例子：
+num_computed_tokens = 40
+offloaded_block_size = 32
+hits = 2
+→ 计算: 32*(1+2)-40 = 56
+→ 返回 (56, True)
+
+request.num_tokens = 96 (总token)
+offloaded_block_size = 32 (卸载块大小)
+num_computed_tokens = 40 (已计算token)
+hits = 2 (缓存命中2个连续块)
+
+GPU内存状态 (已计算token: 40):
+[■■■■■■■■■■■■■■■■] 卸载块0: token 0-31 (32t, 100%计算)
+[■■■■□□□□□□□□□□□□] 卸载块1: token 32-63 (8/32t计算，24t待计算)
+
+卸载存储中的命中块:（由于第0个卸载块完全计算，所以从第1个卸载块开始检查命中了多少个块，这里举例命中了2个块）
+[□□□□□□□□□□□□□□□□] 卸载块1剩余: token 40-63 (缓存命中)
+[□□□□□□□□□□□□□□□□] 卸载块2: token 64-95 (缓存命中)
+
+→ 可加载56个token (24+32)
+加载的时候是以token的每个layer粒度进行加载的，这里返回了token个数
+
+
+def get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -&gt; tuple[int | None, bool]:
+
+        # 卸载块也是有单位的，这里的一个卸载块对应多个GPU块
+        # 计算请求总共需要多少个卸载块（不是GPU块）
+        num_blocks = request.num_tokens // self.offloaded_block_size # num_tokens ： 请求的总token数量
+
+        # block_size_factor：如果blocksize=16，offloaded_block_size=32，则block_size_factor为2
+        assert len(request.block_hashes) // self.block_size_factor == num_blocks
+        block_hashes = self._get_block_hashes(request)
+        # 预热
+        self.manager.touch(block_hashes)
+
+        full_block_tokens = self.offloaded_block_size * num_blocks
+
+        # 如果需要的token还不足一个卸载块的大小就不用搬运了
+        if full_block_tokens - num_computed_tokens &lt; self.offloaded_block_size:
+            # we can load less than a block, skip
+            return 0, False
+        # 从已经计算的token的下一个token开始寻找可加载的块
+        start_block_idx = num_computed_tokens // self.offloaded_block_size
+
+        # 返回命中的连续块数
+        hits = self.manager.lookup(
+            self._get_block_hashes(request, start_idx=start_block_idx)
+        )
+        if hits is None:
+            # indicates a lookup that should be tried later
+            return None, False
+        if hits == 0:
+            return 0, False
+
+        num_hit_tokens = (
+            self.offloaded_block_size * (start_block_idx + hits) - num_computed_tokens
+        )
+        logger.debug(
+            "Request %s hit %s offloaded tokens after %s GPU hit tokens",
+            request.request_id,
+            num_hit_tokens,
+            num_computed_tokens,
+        )
+        if num_hit_tokens &lt; self.offloaded_block_size:
+            return 0, False
+
+        if self._blocks_being_loaded:
+            block_hashes = self._get_block_hashes(
+                request, start_idx=start_block_idx, end_idx=start_block_idx + hits
+            )
+
+            if any(
+                block_hash in self._blocks_being_loaded for block_hash in block_hashes
+            ):
+                # hit blocks are being loaded, delay request
+                logger.debug(
+                    "Delaying request %s since some of its blocks are already"
+                    " being loaded",
+                    request.request_id,
+                )
+                return None, False
+
+        return num_hit_tokens, True
+</code></pre>
+<h2>加载</h2>
+<p>Prefill阶段：计算prompt的完整KV缓存 → 需要卸载到远端。生产者<br>
+Decode阶段：每次只生成一个token的KV缓存 → 不需要卸载（太小）。消费者</p>
+<p>特殊情况：<br>
+每个block32个token，</p>
+<h2>卸载</h2>
+<p>Model Execution<br>
+↓<br>
+[GPU KV Cache Updated]<br>
+↓<br>
+save_kv_layer() 遍历各层<br>
+├── 构建(src_gpu, dst_cpu)传输描述符<br>
+├── 提交异步传输任务<br>
+└── 记录传输状态<br>
+↓<br>
+wait_for_save()<br>
+├── 检查传输完成状态<br>
+├── 错误处理/重试<br>
+└── 释放已传输的GPU块</p>
+<p><strong>卸载的时候会检查block的唯一性，只保存不存在的KVcache；</strong></p>
+<p><strong>在卸载的时候一般会将信息存储到manager的内存结构中；</strong></p>
+<h1>模块设计</h1>
+<p>采用 抽象-实现-工厂 的模式<br>
+层1: 抽象接口层 distributed/kv_transfer/kv_connector/v1/base.py<br>
+层2: 工厂层 kv_connector/factory.py<br>
+层3: 具体实现层 kv_connector/v1/offloading_connector.py<br>
+层4: Offloading 专属子系统 v1/kv_offload/<br>
+Connector 实现的内部引擎，仅被 offloading_connector.py 使用</p>
+<p>①  import factory.py<br>
+→ register_connector("OffloadingConnector", ...) 写入注册表<br>
+→ offloading_connector.py 此时未被加载<br>
+在vllm启动时会加载scheduler，scheduler内自动 import factory.py；</p>
+<p>②  Scheduler.<strong>init</strong>()<br>
+→ create_connector(role=SCHEDULER)<br>
+→ importlib 首次加载 offloading_connector.py<br>
+→ OffloadingConnector.<strong>init</strong> → CPUOffloadingSpec（计算块数）<br>
+→ OffloadingConnectorScheduler → CPUBackend + LRUOffloadingManager</p>
+<p>③  Worker.initialize_from_config()  （KV cache 内存分配完成后）<br>
+→ ensure_kv_transfer_initialized()<br>
+→ create_connector(role=WORKER)<br>
+→ OffloadingConnector.<strong>init</strong> → CPUOffloadingSpec（计算块数）<br>
+→ OffloadingConnectorWorker → OffloadingWorker（空路由表）</p>
+<p>④  gpu_model_runner.initialize_kv_cache()<br>
+→ get_kv_connector() → ActiveKVConnector<br>
+→ register_kv_caches()<br>
+→ CpuGpuOffloadingHandlers 创建<br>
+→ 分配 pin memory、初始化 CUDA stream 池  ← 真正的 GPU/CPU 资源在此分配</p></div>
+<div style="font-size:small;margin-top:8px;float:right;"></div>
+
+<button class="btn btn-block" type="button" onclick="openComments()" id="cmButton">评论</button>
+<div class="comments" id="comments"></div>
+
+</div>
+    <div id="footer"><div id="footer1">Copyright © <span id="copyrightYear"></span> <a href="https://xx2565.github.io/Inkwell">Xa Inkwell</a></div>
+<div id="footer2">
+    <span id="runday"></span><span>Powered by <a href="https://meekdai.com/Gmeek.html" target="_blank">Gmeek</a></span>
+</div>
+
+<script>
+var now=new Date();
+document.getElementById("copyrightYear").innerHTML=now.getFullYear();
+
+if(""!=""){
+    var startSite=new Date("");
+    var diff=now.getTime()-startSite.getTime();
+    var diffDay=Math.floor(diff/(1000*60*60*24));
+    document.getElementById("runday").innerHTML="网站运行 "+diffDay+" 天"+" • ";
+}
+</script></div>
+</body>
+<script>
+var IconList={'sun': 'M8 10.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM8 12a4 4 0 100-8 4 4 0 000 8zM8 0a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0V.75A.75.75 0 018 0zm0 13a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 018 13zM2.343 2.343a.75.75 0 011.061 0l1.06 1.061a.75.75 0 01-1.06 1.06l-1.06-1.06a.75.75 0 010-1.06zm9.193 9.193a.75.75 0 011.06 0l1.061 1.06a.75.75 0 01-1.06 1.061l-1.061-1.06a.75.75 0 010-1.061zM16 8a.75.75 0 01-.75.75h-1.5a.75.75 0 010-1.5h1.5A.75.75 0 0116 8zM3 8a.75.75 0 01-.75.75H.75a.75.75 0 010-1.5h1.5A.75.75 0 013 8zm10.657-5.657a.75.75 0 010 1.061l-1.061 1.06a.75.75 0 11-1.06-1.06l1.06-1.06a.75.75 0 011.06 0zm-9.193 9.193a.75.75 0 010 1.06l-1.06 1.061a.75.75 0 11-1.061-1.06l1.06-1.061a.75.75 0 011.061 0z', 'moon': 'M9.598 1.591a.75.75 0 01.785-.175 7 7 0 11-8.967 8.967.75.75 0 01.961-.96 5.5 5.5 0 007.046-7.046.75.75 0 01.175-.786zm1.616 1.945a7 7 0 01-7.678 7.678 5.5 5.5 0 107.678-7.678z', 'sync': 'M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z', 'home': 'M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z', 'github': 'M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z', 'copy': 'M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z', 'check': 'M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z'};
+var utterancesLoad=0;
+
+let themeSettings={
+    "dark": ["dark","moon","#00f0ff","dark-blue"],
+    "light": ["light","sun","#ff5000","github-light"],
+    "auto": ["auto","sync","","preferred-color-scheme"]
+};
+function changeTheme(mode, icon, color, utheme){
+    document.documentElement.setAttribute("data-color-mode",mode);
+    document.getElementById("themeSwitch").setAttribute("d",value=IconList[icon]);
+    document.getElementById("themeSwitch").parentNode.style.color=color;
+    if(utterancesLoad==1){utterancesTheme(utheme);}
+}
+function modeSwitch(){
+    let currentMode=document.documentElement.getAttribute('data-color-mode');
+    let newMode = currentMode === "light" ? "dark" : currentMode === "dark" ? "auto" : "light";
+    localStorage.setItem("meek_theme", newMode);
+    if(themeSettings[newMode]){
+        changeTheme(...themeSettings[newMode]);
+    }
+}
+function utterancesTheme(theme){
+    const message={type:'set-theme',theme: theme};
+    const iframe=document.getElementsByClassName('utterances-frame')[0];
+    iframe.contentWindow.postMessage(message,'https://utteranc.es');
+}
+if(themeSettings[theme]){changeTheme(...themeSettings[theme]);}
+console.log("\n %c Gmeek last https://github.com/Meekdai/Gmeek \n","padding:5px 0;background:#02d81d;color:#fff");
+</script>
+
+<script>
+document.getElementById("pathHome").setAttribute("d",IconList["home"]);
+document.getElementById("pathIssue").setAttribute("d",IconList["github"]);
+
+
+
+function openComments(){
+    cm=document.getElementById("comments");
+    cmButton=document.getElementById("cmButton");
+    cmButton.disabled=true;
+    cmButton.innerHTML="loading";
+    span=document.createElement("span");
+    span.setAttribute("class","AnimatedEllipsis");
+    cmButton.appendChild(span);
+
+    script=document.createElement("script");
+    script.setAttribute("src","https://utteranc.es/client.js");
+    script.setAttribute("repo","xx2565/Inkwell");
+    script.setAttribute("issue-term","title");
+    
+    if(localStorage.getItem("meek_theme")=="dark"){script.setAttribute("theme","dark-blue");}
+    else if(localStorage.getItem("meek_theme")=="light") {script.setAttribute("theme","github-light");}
+    else{script.setAttribute("theme","preferred-color-scheme");}
+    
+    script.setAttribute("crossorigin","anonymous");
+    script.setAttribute("async","");
+    cm.appendChild(script);
+
+    int=self.setInterval("iFrameLoading()",200);
+}
+
+function iFrameLoading(){
+    var utterances=document.getElementsByClassName('utterances');
+    if(utterances.length==1){
+        if(utterances[0].style.height!=""){
+            utterancesLoad=1;
+            int=window.clearInterval(int);
+            document.getElementById("cmButton").style.display="none";
+            console.log("utterances Load OK");
+        }
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const createClipboardHTML = (codeContent, additionalClasses = '') => `
+        <pre class="notranslate"><code class="notranslate">${codeContent}</code></pre>
+        <div class="clipboard-container position-absolute right-0 top-0 ${additionalClasses}">
+            <clipboard-copy class="ClipboardButton btn m-2 p-0" role="button" style="display: inherit;">
+                <svg height="16" width="16" class="octicon octicon-copy m-2"><path d="${IconList["copy"]}"></path></svg>
+                <svg height="16" width="16" class="octicon octicon-check color-fg-success m-2 d-none"><path d="${IconList["check"]}"></path></svg>
+            </clipboard-copy>
+            <div class="copy-feedback">Copied!</div>
+        </div>
+    `;
+
+    const handleCodeElements = (selector = '') => {
+        document.querySelectorAll(selector).forEach(codeElement => {
+            const codeContent = codeElement.innerHTML;
+            const newStructure = document.createElement('div');
+            newStructure.className = 'snippet-clipboard-content position-relative overflow-auto';
+            newStructure.innerHTML = createClipboardHTML(codeContent);
+
+            const parentElement = codeElement.parentElement;
+            if (selector.includes('highlight')) {
+                parentElement.insertBefore(newStructure, codeElement.nextSibling);
+                parentElement.removeChild(codeElement);
+            } else {
+                parentElement.parentElement.replaceChild(newStructure, parentElement);
+            }
+        });
+    };
+
+    handleCodeElements('pre.notranslate > code.notranslate');
+    handleCodeElements('div.highlight > pre.notranslate');
+
+    let currentFeedback = null;
+    document.querySelectorAll('clipboard-copy').forEach(copyButton => {
+        copyButton.addEventListener('click', () => {
+            const codeContent = copyButton.closest('.snippet-clipboard-content').innerText;
+            const tempTextArea = document.createElement('textarea');
+            tempTextArea.value = codeContent;
+            document.body.appendChild(tempTextArea);
+            tempTextArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempTextArea);
+
+            const copyIcon = copyButton.querySelector('.octicon-copy');
+            const checkIcon = copyButton.querySelector('.octicon-check');
+            const copyFeedback = copyButton.nextElementSibling;
+
+            if (currentFeedback && currentFeedback !== copyFeedback) {currentFeedback.style.display = 'none';}
+            currentFeedback = copyFeedback;
+
+            copyIcon.classList.add('d-none');
+            checkIcon.classList.remove('d-none');
+            copyFeedback.style.display = 'block';
+            copyButton.style.borderColor = 'var(--color-success-fg)';
+
+            setTimeout(() => {
+                copyIcon.classList.remove('d-none');
+                checkIcon.classList.add('d-none');
+                copyFeedback.style.display = 'none';
+                copyButton.style.borderColor = '';
+            }, 2000);
+        });
+    });
+});
+
+</script>
+
+
+</html>

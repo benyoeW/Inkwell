@@ -1,5 +1,4 @@
-<?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Xa Inkwell</title><link>https://xx2565.github.io/Inkwell</link><description>daily learning &amp; working</description><copyright>Xa Inkwell</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://xx2565.github.io/Inkwell</link></image><lastBuildDate>Thu, 12 Mar 2026 13:14:31 +0000</lastBuildDate><managingEditor>Xa Inkwell</managingEditor><ttl>60</ttl><webMaster>Xa Inkwell</webMaster><item><title>KV connector</title><link>https://xx2565.github.io/Inkwell/post/KV%20connector.html</link><description>1. RequestA进入等待队列
+1. RequestA进入等待队列
 2. 调度器发现RequestA有远程KV → 设置为WAITING_FOR_REMOTE_KVS
 3. 启动异步传输，RequestA放入skipped队列
 4. 调度器处理RequestB、RequestC（不阻塞！）
@@ -13,9 +12,9 @@
 可以先看一下waiting的代码；
 
 一个请求从sheduler侧开始：
-  **某schedule轮次**：先获取远端可传输的token --&gt; 申请显存空间 --&gt; 构造远端传输的元数据 --&gt; 异步的话更改请求状态(end)
-  **某schedule轮次**：若请求状态为等待KV传输--&gt;是否传输就绪--&gt;是则为申请的显存缓存KV，并更改请求状态--〉调度（end）
-                                                                                                      --&gt;否则让请求进入临时队列（end）
+  **某schedule轮次**：先获取远端可传输的token --> 申请显存空间 --> 构造远端传输的元数据 --> 异步的话更改请求状态(end)
+  **某schedule轮次**：若请求状态为等待KV传输-->是否传输就绪-->是则为申请的显存缓存KV，并更改请求状态--〉调度（end）
+                                                                                                      -->否则让请求进入临时队列（end）
 
 **某update_from_output轮次**：（......）--》worker侧完成传输之后，将 KVconnector 中完成的请求放到 scheduler类中的 finished_recving_kv_req_ids 中
 **某schedule轮次**：_update_waiting_for_remote_kv 检查finished_recving_kv_req_ids远程传输KV请求是否就绪，若就绪更新分配block的元数据（**传输完成后则说明该KV已经分配到对应block当中了**）
@@ -24,7 +23,7 @@ shceduler.py代码
 ```
         # Next, schedule the WAITING requests. ==========================================================
         if not preempted_reqs:
-            while self.waiting and token_budget &gt; 0:
+            while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -43,7 +42,7 @@ shceduler.py代码
                             request.status = RequestStatus.WAITING
                     else:
                         logger.debug(
-                            '%s is still in WAITING_FOR_REMOTE_KVS state.',
+                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id,
                         )
                         self.waiting.pop_request()
@@ -126,7 +125,7 @@ shceduler.py代码
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                 else:
-                    # KVTransfer: WAITING reqs have num_computed_tokens &gt; 0
+                    # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
                     # 在传输好KV之前就已经标记好了该请求的num_computed_tokens
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
@@ -142,7 +141,7 @@ shceduler.py代码
                 # 异步加载，加载本请求的KVcache同时处理其他请求
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
-                    assert num_external_computed_tokens &gt; 0
+                    assert num_external_computed_tokens > 0
                     # 这里不进行调度，只分配显存
                     num_new_tokens = 0
                     # 后面设置请求的状态为WAITING_FOR_REMOTE_KVS
@@ -155,21 +154,21 @@ shceduler.py代码
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
                     threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 &lt; threshold &lt; num_new_tokens:
+                    if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
                     if (
                         not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens &gt; token_budget
+                        and num_new_tokens > token_budget
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
-                    assert num_new_tokens &gt; 0
+                    assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
@@ -285,7 +284,7 @@ shceduler.py代码
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
                 else:
-                    raise RuntimeError(f'Invalid request status: {request.status}')
+                    raise RuntimeError(f"Invalid request status: {request.status}")
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
@@ -299,7 +298,7 @@ shceduler.py代码
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
-                if request.num_cached_tokens &lt; 0:
+                if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
 
 ```
@@ -357,7 +356,7 @@ post_forward调用链路：
 ## 举例：
 Scheduler端：
 1. 请求A分配blocks [4,5,6], 需要传输35个token
-2. 构建ReqMeta(request_id='A', block_ids=[4,5,6], num_tokens=35)
+2. 构建ReqMeta(request_id="A", block_ids=[4,5,6], num_tokens=35)
 3. 放入P2pNcclConnectorMetadata.requests列表
 
 Worker端：
@@ -375,27 +374,27 @@ Worker端：
 不使用OffloadingConnector：
 ```
 # 调用链
-用户 -&gt; vllm.LLM.genreate()           # 入口
-      -&gt; vllm/v1/engine.py           # 引擎
-      -&gt; vllm/v1/core/sched/scheduler.py  # 基础调度
-      -&gt; vllm/v1/worker/model_runner.py   # 模型执行
-      -&gt; vllm/attention/layers/*.py  # 注意力计算
+用户 -> vllm.LLM.genreate()           # 入口
+      -> vllm/v1/engine.py           # 引擎
+      -> vllm/v1/core/sched/scheduler.py  # 基础调度
+      -> vllm/v1/worker/model_runner.py   # 模型执行
+      -> vllm/attention/layers/*.py  # 注意力计算
 ```
 使用OffloadingConnector：
 ```
 # 调用链（扩展）
-用户 -&gt; vllm.LLM.generate()          # 入口
-      -&gt; vllm/v1/engine.py           # 引擎（检测KVTransferConfig）
-      -&gt; vllm/v1/core/sched/scheduler.py  # 调度+Connector决策
+用户 -> vllm.LLM.generate()          # 入口
+      -> vllm/v1/engine.py           # 引擎（检测KVTransferConfig）
+      -> vllm/v1/core/sched/scheduler.py  # 调度+Connector决策
            ↳ vllm/distributed/kv_transfer/kv_connector/factory.py
            ↳ vllm/v1/kv_offload/factory.py
            ↳ vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
            ↳ vllm/v1/kv_offload/arc_manager.py
       
-      -&gt; vllm/v1/worker/model_runner.py   # 执行+传输
+      -> vllm/v1/worker/model_runner.py   # 执行+传输
            ↳ vllm/v1/worker/kv_connector_model_runner_mixin.py
            
-      -&gt; vllm/attention/layers/*.py  # 注意力计算+传输同步
+      -> vllm/attention/layers/*.py  # 注意力计算+传输同步
            ↳ vllm/attention/utils/kv_transfer_utils.py
 ```
 
@@ -406,7 +405,7 @@ connector维护了两个role：scheduler和worker
 
 ## scheduler
 场景设定
-用户请求：prompt = '北京是中国的首都，它的人口是'  (10个token)
+用户请求：prompt = "北京是中国的首都，它的人口是"  (10个token)
 远端 Prefill 机器 已经算过这个 prompt 的前8个token的 KV Cache
 本地 已经缓存了前3个token的 KV Cache
 **get_num_new_matched_tokens()**
@@ -419,12 +418,12 @@ Scheduler Step:
   [新请求 req_A 进来]
        ↓
   get_num_new_matched_tokens(req_A, num_computed=3)
-  → 返回 (5, True)  '远端有5个token可以给你'
+  → 返回 (5, True)  "远端有5个token可以给你"
        ↓
   KVCacheManager 分配 block_0, block_1 给这5个token
        ↓
   update_state_after_alloc(req_A, blocks, num_external=5)
-  → Connector 内部记录: 'block_0,1 要从远端拉数据'
+  → Connector 内部记录: "block_0,1 要从远端拉数据"
        ↓
   ... 处理其他请求 ...
        ↓
@@ -456,25 +455,25 @@ Scheduler Step:
   [前向传播开始，逐层执行]
 
   --- Layer 0 ---
-⑦  wait_for_layer_load('layer_0')
+⑦  wait_for_layer_load("layer_0")
     └─ 等待 layer_0 的KV数据到达（可能短暂阻塞）
     └─ 数据到了 → 返回
 
     [执行 layer_0 的 Attention 计算]
     output_0 = attention_0(input, kv_cache[layer_0])
 
-⑧  save_kv_layer('layer_0', kv_cache['layer_0'], attn_meta)
+⑧  save_kv_layer("layer_0", kv_cache["layer_0"], attn_meta)
     └─ 提取 req_B 对应的KV数据
     └─ 放入发送队列，异步发送给 10.0.0.2
     └─ 立刻返回
 
   --- Layer 1 ---
-⑦  wait_for_layer_load('layer_1')
+⑦  wait_for_layer_load("layer_1")
     └─ 等 layer_1 数据... → 返回
 
     [执行 layer_1 的 Attention 计算]
 
-⑧  save_kv_layer('layer_1', ...)
+⑧  save_kv_layer("layer_1", ...)
     └─ 异步发送 layer_1 的KV
 
   --- Layer 2, 3 ... 同上 ---
@@ -534,7 +533,7 @@ GPU内存状态 (已计算token: 40):
 
 def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
-    ) -&gt; tuple[int | None, bool]:
+    ) -> tuple[int | None, bool]:
 
         # 卸载块也是有单位的，这里的一个卸载块对应多个GPU块
         # 计算请求总共需要多少个卸载块（不是GPU块）
@@ -549,7 +548,7 @@ def get_num_new_matched_tokens(
         full_block_tokens = self.offloaded_block_size * num_blocks
 
         # 如果需要的token还不足一个卸载块的大小就不用搬运了
-        if full_block_tokens - num_computed_tokens &lt; self.offloaded_block_size:
+        if full_block_tokens - num_computed_tokens < self.offloaded_block_size:
             # we can load less than a block, skip
             return 0, False
         # 从已经计算的token的下一个token开始寻找可加载的块
@@ -569,12 +568,12 @@ def get_num_new_matched_tokens(
             self.offloaded_block_size * (start_block_idx + hits) - num_computed_tokens
         )
         logger.debug(
-            'Request %s hit %s offloaded tokens after %s GPU hit tokens',
+            "Request %s hit %s offloaded tokens after %s GPU hit tokens",
             request.request_id,
             num_hit_tokens,
             num_computed_tokens,
         )
-        if num_hit_tokens &lt; self.offloaded_block_size:
+        if num_hit_tokens < self.offloaded_block_size:
             return 0, False
 
         if self._blocks_being_loaded:
@@ -587,8 +586,8 @@ def get_num_new_matched_tokens(
             ):
                 # hit blocks are being loaded, delay request
                 logger.debug(
-                    'Delaying request %s since some of its blocks are already'
-                    ' being loaded',
+                    "Delaying request %s since some of its blocks are already"
+                    " being loaded",
                     request.request_id,
                 )
                 return None, False
@@ -599,367 +598,65 @@ def get_num_new_matched_tokens(
 
 
 ## 加载
-Prefill阶段：计算prompt的完整KV缓存 → 需要卸载到远端。</description><guid isPermaLink="true">https://xx2565.github.io/Inkwell/post/KV%20connector.html</guid><pubDate>Fri, 06 Mar 2026 11:02:42 +0000</pubDate></item><item><title>profilling</title><link>https://xx2565.github.io/Inkwell/post/profilling.html</link><description># torch profiller
-## 采集流程
-### sglang
-服务端：
-1. 开启sglang服务
-2. 进行压测
+Prefill阶段：计算prompt的完整KV缓存 → 需要卸载到远端。生产者
+Decode阶段：每次只生成一个token的KV缓存 → 不需要卸载（太小）。消费者
 
-客户端：
-开启压测之后，在压测过程中采用以下指令
-export SGLANG_TORCH_PROFILER_DIR=/sgl-workspace/sglang/trace_file // 这是保存采集文件的目标路径，如果不设置一般会保存到/tmp
-curl -X POST http://127.0.0.1:8000/start_profile  // 开启的开关
-curl -X POST http://127.0.0.1:8000/stop_profile  // 关闭的开关
-采集的文件一般以*.trace.json.gz命名，若多个卡则有多个该文件
-注意：采集了10s左右，大概3个G大小
-### vllm
-【待施工】
-## hta
-官方参考 https://docs.pytorch.org/tutorials/beginner/hta_intro_tutorial.html
-`from hta.trace_analysis import TraceAnalysis`
-&gt; 采集文件的文件夹的地址，一般多个文件都放在一个文件夹内，hta会自动遍历这些文件
-`trace_dir = '/Users/xawei/wxx_workspace/profilling/target_file_dir'`  
+特殊情况：
+每个block32个token，
 
-`analyzer = TraceAnalysis(trace_dir=trace_dir)`
+## 卸载
 
-下面是一些可视化方法，运行之后会打开浏览器自动显示hta分析信息
-
-&gt; time_spent_df = analyzer.get_temporal_breakdown()
-&gt; idle_time_df = analyzer.get_idle_time_breakdown()
-&gt; kernel_type_metrics_df, kernel_metrics_df = analyzer.get_gpu_kernel_breakdown()
-&gt; overlap_df = analyzer.get_comm_comp_overlap()
-
-
-
-
-# nsys
-。</description><guid isPermaLink="true">https://xx2565.github.io/Inkwell/post/profilling.html</guid><pubDate>Tue, 03 Mar 2026 06:10:47 +0000</pubDate></item><item><title>【vllm】 线上模式</title><link>https://xx2565.github.io/Inkwell/post/%E3%80%90vllm%E3%80%91%20-xian-shang-mo-shi.html</link><description># APIserver在框架中的作用
-## 调用链路
-vLLM的online serving采用分层架构，从HTTP接口到核心推理引擎的完整链路如下：
-
-客户端请求 → HTTP服务器 → API路由 → 服务层 → 引擎客户端 → 核心引擎 → 推理执行
-
-具体文件链路：
-examples/online_serving/openai_chat_completion_client.py (客户端)
+Model Execution
     ↓
-vllm/entrypoints/openai/api_server.py (HTTP服务器入口)          压测其服务的文件地址
-    ↓  
-vllm/entrypoints/openai/chat_completion/api_router.py (API路由)
+[GPU KV Cache Updated]
     ↓
-vllm/entrypoints/openai/chat_completion/serving.py (服务层)
+save_kv_layer() 遍历各层
+    ├── 构建(src_gpu, dst_cpu)传输描述符
+    ├── 提交异步传输任务
+    └── 记录传输状态
     ↓
-vllm/v1/engine/async_llm.py (异步引擎客户端)
-    ↓
-vllm/v1/engine/core_client.py (引擎核心客户端)
-    ↓
-vllm/v1/engine/core.py (核心引擎)
-    ↓
-vllm/v1/executor/ (推理执行器)
+wait_for_save() 
+    ├── 检查传输完成状态
+    ├── 错误处理/重试
+    └── 释放已传输的GPU块
+
+**卸载的时候会检查block的唯一性，只保存不存在的KVcache；**
+
+**在卸载的时候一般会将信息存储到manager的内存结构中；**
 
 
-客户端 (examples/online_serving/openai_chat_completion_client.py)
-    ↓ HTTP请求到 http://localhost:8000/v1/chat/completions
-服务器 (vllm/entrypoints/openai/api_server.py)
-    ↓ 路由到 vllm/entrypoints/openai/chat_completion/api_router.py
-    ↓ 调用 vllm/entrypoints/openai/chat_completion/serving.py
-    ↓ 委托给 vllm/v1/engine/async_llm.py
-
-## 服务模式和程序模式的区别：
-场景 1：前端网页要用模型👉 那只能走 HTTP  
-场景 2：很多人同时用模型👉 模型必须只加载一次  
-场景 3：模型要一直开着（7×24）👉 不适合做服务  
-API Server 就是为了解决上面这些问题  
-
-## 什么是 FastAPI？
-如果没有 FastAPI，你要手写很多麻烦的东西：
-解析 HTTP
-解析 JSON
-校验参数
-返回结果
-FastAPI 帮你全做了。</description><guid isPermaLink="true">https://xx2565.github.io/Inkwell/post/%E3%80%90vllm%E3%80%91%20-xian-shang-mo-shi.html</guid><pubDate>Fri, 06 Feb 2026 08:11:47 +0000</pubDate></item><item><title>gpu coding&amp;arch</title><link>https://xx2565.github.io/Inkwell/post/gpu%20coding%26arch.html</link><description># gemm
-```c++
-#include &lt;cuda_runtime.h&gt;
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-
-# define BLOCKSIZE 16
-
-__global__ void gemm_kernel_tile(const float* __restrict__ a,
-                                  const float* __restrict__ b,
-                                  float* __restrict__ c,
-                                  int M, int N, int K){
-                                
-                                int y = blockIdx.y * blockDim.y + threadIdx.y;
-                                int x = blockIdx.x * blockDim.x + threadIdx.x;
-                                
-                                __shared__ float a_tile[BLOCKSIZE][BLOCKSIZE], b_tile[BLOCKSIZE][BLOCKSIZE];
-                                
-                                float sum = 0.0f;
-
-                                for(int i=0;i&lt;K/BLOCKSIZE;++i){
-                                    // load to sahared memory a
-                                    int ax = threadIdx.x + i * BLOCKSIZE;
-                                    int ay = y;
-                                    if(ax &lt; K &amp;&amp; ay &lt; M){
-                                        a_tile[threadIdx.y][threadIdx.x] = a[ay * K + ax];   // ⭐️ 防止共享内存坐标越界
-                                    }else{
-                                        a_tile[threadIdx.y][threadIdx.x] = 0.0f;
-                                    }
-                                    // load to sahared memory b
-                                    int bx = threadIdx.x;
-                                    int by = threadIdx.y + i * BLOCKSIZE;
-                                    if(bx &lt; N &amp;&amp; by &lt; K){
-                                        b_tile[threadIdx.y][threadIdx.x] = b[by * N + bx];
-                                    }else{
-                                        b_tile[threadIdx.y][threadIdx.x] = 0.0f;
-                                    }
-
-                                    __syncthreads();  // ⭐️ 数据加载完成之后同步
-
-                                    
-                                    for(int i=0;i&lt;BLOCKSIZE;++i){
-                                        sum += a_tile[threadIdx.y][i] * b_tile[i][threadIdx.x];
-                                    }
-                                    __syncthreads();  // ⭐️ 同步，防止提前进入下一轮计算然后累加错误
-                                }
-                                if(x &lt; N &amp;&amp; y &lt; M){
-                                    c[y * N + x] = sum;
-                                }
-                            }
-                                    
 
 
-__global__ void gemm_kernel(const float* __restrict__ a,
-                            const float* __restrict__ b,
-                            float* __restrict__ c,
-                            int M, int N, int K) {
-    // Each thread computes one element of C
-    int row = blockIdx.y * blockDim.y + threadIdx.y; // y -&gt; row in C (0..M-1)
-    int col = blockIdx.x * blockDim.x + threadIdx.x; // x -&gt; col in C (0..N-1)
 
-    if (row &lt; M &amp;&amp; col &lt; N) {
-        float sum = 0.0f;
-        for (int k = 0; k &lt; K; ++k) {
-            // A[row][k] * B[k][col]
-            sum += a[row * K + k] * b[k * N + col];
-        }
-        c[row * N + col] = sum;
-    }
-}
+# 模块设计
+采用 抽象-实现-工厂 的模式
+层1: 抽象接口层 distributed/kv_transfer/kv_connector/v1/base.py
+层2: 工厂层 kv_connector/factory.py
+层3: 具体实现层 kv_connector/v1/offloading_connector.py
+层4: Offloading 专属子系统 v1/kv_offload/
+        Connector 实现的内部引擎，仅被 offloading_connector.py 使用
 
-int main() {
-    // Matrix dimensions: A(MxK) * B(KxN) = C(MxN)
-    const int M = 5000;
-    const int K = 6000;
-    const int N = 4000;
+①  import factory.py
+    → register_connector("OffloadingConnector", ...) 写入注册表
+    → offloading_connector.py 此时未被加载
+在vllm启动时会加载scheduler，scheduler内自动 import factory.py；
 
-    const size_t size_a = M * K * sizeof(float);
-    const size_t size_b = K * N * sizeof(float);
-    const size_t size_c = M * N * sizeof(float);
+②  Scheduler.__init__()
+    → create_connector(role=SCHEDULER)
+      → importlib 首次加载 offloading_connector.py
+      → OffloadingConnector.__init__ → CPUOffloadingSpec（计算块数）
+      → OffloadingConnectorScheduler → CPUBackend + LRUOffloadingManager
 
-    // Host memory allocation
-    float *h_a = (float*)malloc(size_a);
-    float *h_b = (float*)malloc(size_b);
-    float *h_c = (float*)malloc(size_c);
-    float *h_c_ref = (float*)malloc(size_c); // Optional: CPU reference
+③  Worker.initialize_from_config()  （KV cache 内存分配完成后）
+    → ensure_kv_transfer_initialized()
+    → create_connector(role=WORKER)
+      → OffloadingConnector.__init__ → CPUOffloadingSpec（计算块数）
+      → OffloadingConnectorWorker → OffloadingWorker（空路由表）
 
-    // Initialize host matrices
-    for (int i = 0; i &lt; M * K; ++i) h_a[i] = 1.0f; // A all 1s
-    for (int i = 0; i &lt; K * N; ++i) h_b[i] = 2.0f; // B all 2s
-    for (int i = 0; i &lt; M * N; ++i) h_c[i] = 0.0f; // Initialize to 0
+④  gpu_model_runner.initialize_kv_cache()
+    → get_kv_connector() → ActiveKVConnector
+    → register_kv_caches()
+      → CpuGpuOffloadingHandlers 创建
+      → 分配 pin memory、初始化 CUDA stream 池  ← 真正的 GPU/CPU 资源在此分配
 
-    // Device memory allocation
-    float *d_a, *d_b, *d_c;
-    cudaError_t err;
 
-    err = cudaMalloc(&amp;d_a, size_a);
-    if (err != cudaSuccess) { fprintf(stderr, 'cudaMalloc d_a failed: %s\n', cudaGetErrorString(err)); return 1; }
-
-    err = cudaMalloc(&amp;d_b, size_b);
-    if (err != cudaSuccess) { fprintf(stderr, 'cudaMalloc d_b failed: %s\n', cudaGetErrorString(err)); return 1; }
-
-    err = cudaMalloc(&amp;d_c, size_c);
-    if (err != cudaSuccess) { fprintf(stderr, 'cudaMalloc d_c failed: %s\n', cudaGetErrorString(err)); return 1; }
-
-    // Copy data from host to device
-    cudaMemcpy(d_a, h_a, size_a, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b, h_b, size_b, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_c, h_c, size_c, cudaMemcpyHostToDevice);
-
-    // Kernel launch configuration
-    dim3 blockSize(16, 16); // 256 threads per block
-    dim3 gridSize((N + blockSize.x - 1) / blockSize.x,
-                  (M + blockSize.y - 1) / blockSize.y);
-
-    // Launch kernel
-    gemm_kernel_tile&lt;&lt;&lt;gridSize, blockSize&gt;&gt;&gt;(d_a, d_b, d_c, M, N, K);
-
-    // Check for kernel launch errors
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, 'Kernel launch failed: %s\n', cudaGetErrorString(err));
-        return 1;
-    }
-
-    // Wait for GPU to finish
-    cudaDeviceSynchronize();
-
-    // Copy result back to host
-    cudaMemcpy(h_c, d_c, size_c, cudaMemcpyDeviceToHost);
-
-    printf('First 10 elements of C (row 0, columns 0～9):\n');
-    for (int i = 0; i &lt; 10 &amp;&amp; i &lt; N; ++i) {
-        printf('C[0][%d] = %.2f\n', i, h_c[i]);
-    }
-    printf('\n');
-
-    // Optional: Verify result (C should be all 2*K = 400.0f)
-    bool correct = true;
-    float expected = 2.0f * K; // since A=1, B=2, sum over K terms: 1*2*K
-    for (int i = 0; i &lt; M * N; ++i) {
-        if (abs(h_c[i] - expected) &gt; 1e-5) {
-            correct = false;
-            break;
-        }
-    }
-
-    printf('Matrix multiplication result: %s\n', correct ? 'PASSED' : 'FAILED');
-    if (!correct) {
-        printf('Example: h_c[0] = %f, expected = %f\n', h_c[0], expected);
-    }
-
-    // Cleanup
-    free(h_a); free(h_b); free(h_c); free(h_c_ref);
-    cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
-    // no
-    return 0;
-}
-
-```
-
-# transpose
-```c++
-# include &lt;stdio.h&gt;
-# include &lt;math.h&gt;
-
-#define BLOCK_SIZE 32
-#define M 3000
-#define N 1000
-
-__managed__ int matrix[N][M];
-__managed__ int gpu_result[M][N];
-__managed__ int cpu_result[M][N];
-
-__global__ void gpu_matrix_transpose(int in[N][M], int out[M][N])
-{
-    int x = threadIdx.x + blockDim.x * blockIdx.x;
-    int y = threadIdx.y + blockDim.y * blockIdx.y;
-
-    if( x &lt; M &amp;&amp; y &lt; N)
-    {
-        out[x][y] = in[y][x];
-    }
-}
-
-// 创建m行，n列的线程数量【由多个线程块组成的】
-__global__ void gpu_shared_matrix_transpose(int in[N][M], int out[M][N])
-{
-
-    int y = threadIdx.y + blockDim.y * blockIdx.y;
-    int x = threadIdx.x + blockDim.x * blockIdx.x;
-
-    __shared__ int ken[BLOCK_SIZE+1][BLOCK_SIZE+1];//ken[32] warp
-
-    // step1：
-    if(x &lt; M &amp;&amp; y &lt; N)
-    {   
-        // step1：读到共享内存
-        ken[threadIdx.y][threadIdx.x] = in[y][x];
-    }
-    __syncthreads();
-
-    // 原则：相邻的线程访问相邻的坐标
-
-    // step2：  块反转，块内坐标不变
-    int x1 = threadIdx.x + blockDim.y * blockIdx.y;
-    int y1 = threadIdx.y + blockDim.x * blockIdx.x;
-    
-    if(x1 &lt; N &amp;&amp; y1 &lt; M)
-    {
-    // step3：从共享内存读到输出数据
-        out[y1][x1] = ken[threadIdx.x][threadIdx.y];//32 bank
-    }
-
-}
-
-void cpu_matrix_transpose(int in[N][M], int out[M][N])
-{
-    for(int y = 0; y &lt; N; y++)
-    {
-        for(int x = 0; x &lt; M; x++)
-        {
-            out[x][y] = in[y][x];
-        }
-    }
-}
-
-int main()
-{
-    for(int y=0; y&lt;N; y++)
-    {
-        for(int x=0; x&lt;M; x++)
-        {
-            matrix[y][x] = rand()%1024;
-        }
-    }
-
-    cudaEvent_t start, stop_gpu, stop_cpu;
-    cudaEventCreate(&amp;start);
-    cudaEventCreate(&amp;stop_cpu);
-    cudaEventCreate(&amp;stop_gpu);
-
-    cudaEventRecord(start);
-    cudaEventSynchronize(start);
-
-    dim3 dimGrid((M + BLOCK_SIZE - 1)/BLOCK_SIZE, (N + BLOCK_SIZE -1)/BLOCK_SIZE);
-    dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
-
-    for(int i = 0; i &lt; 20; i++)
-    {
-        // gpu_matrix_transpose&lt;&lt;&lt;dimGrid,dimBlock&gt;&gt;&gt;(matrix, gpu_result);
-        gpu_shared_matrix_transpose&lt;&lt;&lt;dimGrid,dimBlock&gt;&gt;&gt;(matrix, gpu_result);
-        cudaDeviceSynchronize();
-    }
-
-    cudaEventRecord(stop_gpu);
-    cudaEventSynchronize(stop_gpu);
-
-    cpu_matrix_transpose(matrix, cpu_result);
-
-    cudaEventRecord(stop_cpu);
-    cudaEventSynchronize(stop_cpu);
-
-    float time_cpu, time_gpu;
-    cudaEventElapsedTime(&amp;time_gpu, start, stop_gpu);
-    cudaEventElapsedTime(&amp;time_cpu, stop_gpu, stop_cpu);
-
-    bool errors = false;
-    for(int y = 0; y&lt;M; y++)
-    {
-        for (int x = 0; x &lt; N; x++)
-        {
-            if(fabs(cpu_result[y][x] - gpu_result[y][x]) &gt; (1.0e-10))
-            {
-                errors = true;
-            }
-        }
-        
-    }
-
-    printf('Result: %s\n', errors?'Error':'Pass');
-    printf('CPU time: %.2f\nGPU time: %.2f\n', time_cpu, time_gpu/20.0);
-
-    return 0;
-}
-```。</description><guid isPermaLink="true">https://xx2565.github.io/Inkwell/post/gpu%20coding%26arch.html</guid><pubDate>Sun, 25 Jan 2026 08:57:14 +0000</pubDate></item></channel></rss>
