@@ -1,5 +1,52 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Xa Inkwell</title><link>https://xx2565.github.io/Inkwell</link><description>daily learning &amp; working</description><copyright>Xa Inkwell</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://xx2565.github.io/Inkwell</link></image><lastBuildDate>Thu, 12 Mar 2026 17:05:05 +0000</lastBuildDate><managingEditor>Xa Inkwell</managingEditor><ttl>60</ttl><webMaster>Xa Inkwell</webMaster><item><title>MLA、RoPE</title><link>https://xx2565.github.io/Inkwell/post/MLA%E3%80%81RoPE.html</link><description>&lt;img width='2472' height='1054' alt='Image' src='https://github.com/user-attachments/assets/f11149e1-c60e-4d1f-aa8b-b3ce8e5aad9f' /&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Xa Inkwell</title><link>https://xx2565.github.io/Inkwell</link><description>daily learning &amp; working</description><copyright>Xa Inkwell</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://xx2565.github.io/Inkwell</link></image><lastBuildDate>Fri, 13 Mar 2026 12:30:47 +0000</lastBuildDate><managingEditor>Xa Inkwell</managingEditor><ttl>60</ttl><webMaster>Xa Inkwell</webMaster><item><title>MTP、eagle</title><link>https://xx2565.github.io/Inkwell/post/MTP%E3%80%81eagle.html</link><description>问题记录；
+外部是如何调用DeepSeekMTP
+原始eagle及其代码
+eagle是如何多步进行draft的？目前只看到从model_runner.sample_tokens()发起调用之后进行一步draft；
+eagle mtp vllm流程实现
+草稿的流程
+验证的流程
+
+```
+model_runner.execute_model()
+    │
+    │ ① 主模型前向
+    ├──→ DeepseekV3ForCausalLM.forward()
+    │         └──→ 返回 hidden_states (最后一层输出)
+    │
+    │ ② 主模型采样
+    ├──→ sample_tokens(hidden_states)
+    │         └──→ 返回 sampled_token_ids
+    │
+    │ ③ MTP 投机解码提议
+    └──→ propose_draft(hidden_states)
+              │
+              └──→ EagleSpeculator.propose()
+                        │
+                        │  首步: 用主模型的 hidden_states + sampled_tokens
+                        ├──→ run_model() ──→ DeepSeekMTP.forward()
+                        │         │              │
+                        │         │              └──→ DeepSeekMultiTokenPredictor.forward()
+                        │         │                       │
+                        │         │                       ├── embed_tokens(input_ids)
+                        │         │                       └── MTPLayer.forward(embeds, hidden_states)
+                        │         │                               ├── enorm(embeds) + hnorm(hidden)
+                        │         │                               ├── eh_proj(concat)
+                        │         │                               └── mtp_block(transformer层)
+                        │         │
+                        │         └──→ 返回 new_hidden_states
+                        │
+                        ├──→ compute_logits(new_hidden_states)
+                        │         └──→ SharedHead.norm + head ──→ logits
+                        │
+                        ├──→ sample draft_token
+                        │
+                        │  后续步: 用 MTP 自己的 hidden_states + draft_token (循环)
+                        └──→ 重复 run_model → compute_logits → sample
+                              (共 num_speculative_tokens 步)
+```
+
+。</description><guid isPermaLink="true">https://xx2565.github.io/Inkwell/post/MTP%E3%80%81eagle.html</guid><pubDate>Fri, 13 Mar 2026 12:30:19 +0000</pubDate></item><item><title>MLA、RoPE</title><link>https://xx2565.github.io/Inkwell/post/MLA%E3%80%81RoPE.html</link><description>&lt;img width='2472' height='1054' alt='Image' src='https://github.com/user-attachments/assets/f11149e1-c60e-4d1f-aa8b-b3ce8e5aad9f' /&gt;
 图片链接：
 
 [https://www.bilibili.com/video/BV1fAPceeE7n/?spm_id_from=333.337.search-card.all.click&amp;vd_source=d4d8e34229b29465d437ca4e527e32c5](url)
