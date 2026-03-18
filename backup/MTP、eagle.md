@@ -1,11 +1,62 @@
 问题记录；
 外部是如何调用DeepSeekMTP
-原始eagle及其代码
+拒绝采样的具体函数是怎样
 验证的流程
 在草稿流程scheduler是如何分配KV的？调度机制有什么区别？
 model_runner中的postprocess调用时机。
 draftmodel 的时候加载mtp模型权重的
 
+全局整体调用逻辑：
+```
+run_busy_loop()
+  ├─ _process_input_queue()   ← 从 input_queue 读取新请求/abort
+  └─ _process_engine_step()
+       ├─ step_fn()            ← 即 step() 或 step_with_batch_queue()
+       │    ├─ scheduler.schedule()                    ← ① 调度，决定本轮送哪些请求
+       │    ├─ executor.execute_model(sched_output)   ← ② 触发 GPU 前向
+       │    ├─ scheduler.get_grammar_bitmask()         ← ③ 结构化输出的语法掩码
+       │    ├─ executor.sample_tokens(grammar_output)  ← ④ 采样    这里会进行拒绝采样 & draft model的推测解码前向
+       │    └─ scheduler.update_from_output()          ← ⑤ 处理结果、判断截止
+       └─ post_step()
+            └─ executor.take_draft_token_ids()         ← ⑥ 取出 draft tokens（同步模式）
+                 └─ scheduler.update_draft_token_ids() ← ⑦ 写入 request.spec_token_ids
+
+每个函数的循环与终止条件：
+_process_input_queue：
+       获取所有的请求，并处理完所有获取的请求。这里的处理主要指的是将请求送入到引擎侧
+_process_engine_step：单次执行，不循环
+
+```
+
+
+验证和生成在同一次 sample_tokens 里完成
+投机解码的一个完整推理步骤是这样流动的：
+
+```
+第 N 轮 execute_model
+  ├─ 目标模型前向（带 draft tokens 作为输入）
+  ├─ sample_tokens():
+  │    ├─ self.sample()      ← ①（拒绝采样的验证） 验证上一轮的 draft tokens
+  │    ├─ postprocess()      ← ② 更新状态（已被接受的 token + KV cache 进度）
+  │    └─ propose_draft()    ← ③ 生成下一轮的新 draft tokens
+  └─ 返回结果
+
+***************************************************************************
+
+
+第 N 轮（验证第 N-1 轮的 draft）:
+  目标模型输入: [正常 token..., d0, d1, d2, d3]
+                                 ↑上一轮 draft
+  rejection_sample → 接受 [d0, d1, bonus]，拒绝 [d2, d3]
+  postprocess     → last_sampled = bonus，num_computed += 3
+  propose_draft   → 新 draft [d0', d1', d2', d3']（基于 bonus 的 hidden state）
+  写回 draft_tokens
+
+第 N+1 轮（验证第 N 轮的 draft）:
+  目标模型输入: [正常 token..., bonus, d0', d1', d2', d3']
+  ...
+
+```
 
 # draft token 生成阶段
 ```
@@ -33,7 +84,7 @@ model_runner.execute_model()
                              # 这里也更新了kv_connector_output，获取已完成的请求传输状态
 
 
- draft模型生成
+ draft验证与生成阶段
  sample_tokens(hidden_states)
     │         └──→ 返回 sampled_token_ids
     │
@@ -70,4 +121,27 @@ model_runner.execute_model()
 
 ```
 
-# 验证阶段
+# 关于KVcache
+draft token 的 KV 不写入 prefix cache
+new tokens 包含 verified 和 unverified draft tokens，
+但只缓存 verified tokens（通过 request.num_tokens 来 cap）
+**注意num_computed_token是target model生成的KV，draft model只负责产生token即可**
+
+```
+Scheduler._schedule_running_requests()
+    │
+    ├── num_new_tokens = num_tokens_with_spec(含上轮draft) - num_computed_tokens
+    │
+    └── kv_cache_manager.allocate_slots(
+            num_new_tokens,
+            num_lookahead_tokens = num_spec_tokens  ← 为下一轮 draft 预留
+        )
+            │
+            ├── num_tokens_need_slot = computed + new + lookahead
+            ├── 按 num_tokens_need_slot 分配物理 block
+            └── prefix cache 只写入到 request.num_tokens（不含 draft）
+                   ↑
+                   确保被拒绝的 draft token 不污染 prefix cache
+
+
+```
