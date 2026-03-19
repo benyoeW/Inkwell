@@ -1,10 +1,22 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Xa Inkwell</title><link>https://xx2565.github.io/Inkwell</link><description>daily learning &amp; working</description><copyright>Xa Inkwell</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://xx2565.github.io/Inkwell</link></image><lastBuildDate>Wed, 18 Mar 2026 12:15:17 +0000</lastBuildDate><managingEditor>Xa Inkwell</managingEditor><ttl>60</ttl><webMaster>Xa Inkwell</webMaster><item><title>MTP、eagle</title><link>https://xx2565.github.io/Inkwell/post/MTP%E3%80%81eagle.html</link><description>问题记录；
-外部是如何调用DeepSeekMTP
-拒绝采样的具体函数是怎样
-验证的流程
-在草稿流程scheduler是如何分配KV的？调度机制有什么区别？
-model_runner中的postprocess调用时机。</description><guid isPermaLink="true">https://xx2565.github.io/Inkwell/post/MTP%E3%80%81eagle.html</guid><pubDate>Fri, 13 Mar 2026 12:30:19 +0000</pubDate></item><item><title>MLA、RoPE</title><link>https://xx2565.github.io/Inkwell/post/MLA%E3%80%81RoPE.html</link><description>&lt;img width='2472' height='1054' alt='Image' src='https://github.com/user-attachments/assets/f11149e1-c60e-4d1f-aa8b-b3ce8e5aad9f' /&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Xa Inkwell</title><link>https://xx2565.github.io/Inkwell</link><description>daily learning &amp; working</description><copyright>Xa Inkwell</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://xx2565.github.io/Inkwell</link></image><lastBuildDate>Thu, 19 Mar 2026 08:45:17 +0000</lastBuildDate><managingEditor>Xa Inkwell</managingEditor><ttl>60</ttl><webMaster>Xa Inkwell</webMaster><item><title>MTP、eagle</title><link>https://xx2565.github.io/Inkwell/post/MTP%E3%80%81eagle.html</link><description># 全局整体调用逻辑：
+```
+run_busy_loop()
+  ├─ _process_input_queue()   ← 从 input_queue 读取新请求/abort     # 将请求传输到引擎侧，然后执行下面的函数
+  └─ _process_engine_step() 
+       ├─ step_fn()            ← 即 step() 或 step_with_batch_queue()
+       │    ├─ scheduler.schedule()                    ← ① 调度，决定本轮送哪些请求
+       │    ├─ executor.execute_model(sched_output)   ← ② 触发 GPU 前向
+       │    ├─ scheduler.get_grammar_bitmask()         ← ③ 结构化输出的语法掩码
+       │    ├─ executor.sample_tokens(grammar_output)  ← ④ 采样    这里会进行拒绝采样 &amp; draft model的推测解码前向
+       │    └─ scheduler.update_from_output()          ← ⑤ 处理结果、判断截止
+       └─ post_step()
+            └─ executor.take_draft_token_ids()         ← ⑥ 取出 draft tokens（同步模式）
+                 └─ scheduler.update_draft_token_ids() ← ⑦ 写入 request.spec_token_ids
+
+每个函数的循环与终止条件：
+_process_input_queue：
+       获取所有的请求，并处理完所有获取的请求。</description><guid isPermaLink="true">https://xx2565.github.io/Inkwell/post/MTP%E3%80%81eagle.html</guid><pubDate>Fri, 13 Mar 2026 12:30:19 +0000</pubDate></item><item><title>MLA、RoPE</title><link>https://xx2565.github.io/Inkwell/post/MLA%E3%80%81RoPE.html</link><description>&lt;img width='2472' height='1054' alt='Image' src='https://github.com/user-attachments/assets/f11149e1-c60e-4d1f-aa8b-b3ce8e5aad9f' /&gt;
 图片链接：
 
 [https://www.bilibili.com/video/BV1fAPceeE7n/?spm_id_from=333.337.search-card.all.click&amp;vd_source=d4d8e34229b29465d437ca4e527e32c5](url)
