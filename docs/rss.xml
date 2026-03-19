@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Xa Inkwell</title><link>https://xx2565.github.io/Inkwell</link><description>daily learning &amp; working</description><copyright>Xa Inkwell</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://xx2565.github.io/Inkwell</link></image><lastBuildDate>Thu, 19 Mar 2026 08:45:17 +0000</lastBuildDate><managingEditor>Xa Inkwell</managingEditor><ttl>60</ttl><webMaster>Xa Inkwell</webMaster><item><title>MTP、eagle</title><link>https://xx2565.github.io/Inkwell/post/MTP%E3%80%81eagle.html</link><description># 全局整体调用逻辑：
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Xa Inkwell</title><link>https://xx2565.github.io/Inkwell</link><description>daily learning &amp; working</description><copyright>Xa Inkwell</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://xx2565.github.io/Inkwell</link></image><lastBuildDate>Thu, 19 Mar 2026 09:20:41 +0000</lastBuildDate><managingEditor>Xa Inkwell</managingEditor><ttl>60</ttl><webMaster>Xa Inkwell</webMaster><item><title>【vllm】DeepSeekMTP、eagle</title><link>https://xx2565.github.io/Inkwell/post/%E3%80%90vllm%E3%80%91DeepSeekMTP%E3%80%81eagle.html</link><description># 全局整体调用逻辑：
 ```
 run_busy_loop()
   ├─ _process_input_queue()   ← 从 input_queue 读取新请求/abort     # 将请求传输到引擎侧，然后执行下面的函数
@@ -16,7 +16,7 @@ run_busy_loop()
 
 每个函数的循环与终止条件：
 _process_input_queue：
-       获取所有的请求，并处理完所有获取的请求。</description><guid isPermaLink="true">https://xx2565.github.io/Inkwell/post/MTP%E3%80%81eagle.html</guid><pubDate>Fri, 13 Mar 2026 12:30:19 +0000</pubDate></item><item><title>MLA、RoPE</title><link>https://xx2565.github.io/Inkwell/post/MLA%E3%80%81RoPE.html</link><description>&lt;img width='2472' height='1054' alt='Image' src='https://github.com/user-attachments/assets/f11149e1-c60e-4d1f-aa8b-b3ce8e5aad9f' /&gt;
+       获取所有的请求，并处理完所有获取的请求。</description><guid isPermaLink="true">https://xx2565.github.io/Inkwell/post/%E3%80%90vllm%E3%80%91DeepSeekMTP%E3%80%81eagle.html</guid><pubDate>Fri, 13 Mar 2026 12:30:19 +0000</pubDate></item><item><title>MLA、RoPE</title><link>https://xx2565.github.io/Inkwell/post/MLA%E3%80%81RoPE.html</link><description>&lt;img width='2472' height='1054' alt='Image' src='https://github.com/user-attachments/assets/f11149e1-c60e-4d1f-aa8b-b3ce8e5aad9f' /&gt;
 图片链接：
 
 [https://www.bilibili.com/video/BV1fAPceeE7n/?spm_id_from=333.337.search-card.all.click&amp;vd_source=d4d8e34229b29465d437ca4e527e32c5](url)
