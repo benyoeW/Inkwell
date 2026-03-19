@@ -51,8 +51,8 @@ _process_engine_step：
 ```
 
 # draft token 验证与生成阶段
+## 调用链路总览
 ```
-调用链路总揽
 EngineCore.step()                         # 引擎核心
   └─> Executor.execute_model()            # 执行器 (UniProc/MultiProc/Ray)    ⭐️
       └─> WorkerBase.execute_model()     # Worker 基类
@@ -63,11 +63,10 @@ EngineCore.step()                         # 引擎核心
   └─> Executor.sample_tokens()  ⭐️
        └─> GPUWorker.sample_tokens()
             └─> GPUModelRunner.sample_tokens()        ← 采样 + 拒绝采样 + 草稿提案
+```
 
-
-
-####################### execute_model #######################
-
+##  execute_model
+```
 model_runner.execute_model()
     │
     │  主模型前向
@@ -75,53 +74,124 @@ model_runner.execute_model()
     │         └──→ 返回 hidden_states (最后一层输出) 
                              # 这里将信息到GPUModelRunner类中的execute_model_state参数
                              # 这里也更新了kv_connector_output，获取已完成的请求传输状态
+```
 
-
-####################### sample_tokens #######################
+## sample_tokens
 
  sample_tokens(hidden_states)
-    │         └──→ 返回 sampled_token_ids
+             └──→ 返回 sampled_token_ids
+    
+### 采样
+```
+sample(hidden_states, input_batch)
     │
-    │ MTP 投机解码提议
-    └──→ propose_draft(hidden_states)    # 在sample_tokens函数的最后部分执行
-              │
-              └──→ 调用EagleSpeculator.propose() # 上一个函数只调用本函数
-                        │
-                        │  首步: 用主模型的 hidden_states + sampled_tokens
-                        │  后续: 用前面draft model生成的的 hidden_states + sampled_tokens
-                        ├──→ run_model() ──→ DeepSeekMTP.forward()
-                        │         │              │
-                        │         │              └──→ DeepSeekMultiTokenPredictor.forward()
-                        │         │                       │
-                        │         │                       ├── embed_tokens(input_ids)
-                        │         │                       └── MTPLayer.forward(embeds, hidden_states)
-                        │         │                               ├── enorm(embeds) + hnorm(hidden)
-                        │         │                               ├── eh_proj(concat)
-                        │         │                               └── mtp_block(transformer层)
-                        │         │
-                        │         └──→ 返回 new_hidden_states
-                        │
-                        ├──→ compute_logits(new_hidden_states)     # 这里会加载对应的mtp layer层以及共享的lm_head
-                        │         └──→ SharedHead.norm + head ──→ logits
-                        │                         # 这里做了两步操作：RMSNorm + Linear （hidden --> volcab_size)
-                        │
-                        ├──→ sample draft_token  
-                        │
-                        │  后续步: 用 MTP 自己的 hidden_states + draft_token (循环)  
-                        └──→ 重复 run_model → compute_logits → sample
-                              (共重复了 num_speculative_tokens-1 步,加上开头的1步一共num_speculative_tokens步)
+    ├──→ compute_logits(hidden_states[logits_indices])  # 根据hidden_state进行target model的logits的计算
+    │         │  logits_indices: 只取需要计算logit的位置
+    │         │  在 spec-decode verify 阶段: 每个请求target model会生成 num_draft+1 个位置
+    │         └──→ LM head (Linear) → logits [num_logit_pos, vocab_size]
+    │
+    |        # 这里在下面的拒采样之前会应用到sampler的apply_penalties去修改logits的数值，最下方有关于词频惩罚的说明
+    ├──→ self.sampler(logits)         # Gumbel-max 采样
+    │         └──→ 对target model的每个 logit 位置采样一个 token
+    │              → target_sampled [num_draft_tokens + num_reqs]
+    │              （每个请求: N个验证位置 + 1个bonus位置）
+    │
+    │  ┌── 非 spec-decode ──┐
+    │  │  num_sampled = 1    │   每个请求固定接受1个token
+    │  └────────────────────┘
+    │
+    ├──→ rejection_sample()           # 仅 spec-decode 阶段调用
+    │         │
+    │         │  输入:
+    │         │    target_sampled: 目标模型在每个位置采样的token
+    │         │    input_ids[logits_indices]: draft模型的token（偏移+1）
+    │         │    cu_num_logits: 各请求的token范围前缀和
+    │         │
+    │         └──→ _rejection_sample_kernel [Triton, 每个请求一个program]
+    │                   │
+    │                   │  对每个 draft 位置 i 循环比较:
+    │                   │    target_token[i] == draft_token[i] ?
+    │                   │      ├─ 相等(accept): 存入 target_token[i], 继续
+    │                   │      └─ 不等(reject): 存入 target_token[i] 作为修正
+    │                   │                        停止后续比较
+    │                   │  全部接受时: 额外追加1个 bonus token
+    │                   │
+    │                   └──→ sampled [num_reqs, num_spec_steps+1]
+    │                         num_sampled [num_reqs]
+    │                   # 注意: 无论接受/拒绝，始终写入目标模型的token
+    │                   # 保证输出分布与目标模型一致
+    │
+    └──→ get_num_sampled_and_rejected()  [Triton]
+              │  处理 chunked prefill 场景下的计数修正
+              └──→ (num_sampled [num_reqs], num_rejected [num_reqs])
+```
 
+### 后处理
+```
+postprocess(input_batch, sampled_tokens, num_sampled, num_rejected)
+    │
+    ├──→ post_update()   [input_batch.py, Triton kernel]
+    │         │
+    │         └──→ _post_update_kernel [每个请求一个Triton program]
+    │                   │
+    │                   ├── 写入 last_sampled_tokens[req_state_idx]
+    │                   │     = sampled_tokens 中最后一个被接受的token
+    │                   │     → 下一轮 prepare_eagle_inputs() 用它作为
+    │                   │       Eagle/MTP 输入序列的最后一个位置
+    │                   │
+    │                   ├── 累加 output_bin_counts[num_sampled 个token]
+    │                   │     → 用于重复惩罚(repetition penalty)统计
+    │                   │
+    │                   └── 更新 num_computed_tokens[req_state_idx]
+    │                           += query_len - num_rejected
+    │                         → KV cache manager 据此判断哪些槽位有效
+    │                         → 被拒绝的draft token对应的KV槽位被标记为
+    │                           "可覆盖"，无需显式释放/重新分配
+    │
+    └──→ 更新 num_computed_prefill_tokens [CPU numpy]
+              = min(已计算 + num_scheduled_tokens, prefill总长度)
+              → 用于 chunked prefill 进度追踪
+```
 
-一些详细调用链路和注意点：
+ ### MTP 投机解码提议
+```
+└──→ propose_draft(hidden_states)    # 在sample_tokens函数的最后部分执行
+          │
+          └──→ 调用EagleSpeculator.propose() # 上一个函数只调用本函数
+                    │
+                    │  首步: 用主模型的 hidden_states + sampled_tokens
+                    │  后续: 用前面draft model生成的的 hidden_states + sampled_tokens
+                    ├──→ run_model() ──→ DeepSeekMTP.forward()
+                    │         │              │
+                    │         │              └──→ DeepSeekMultiTokenPredictor.forward()
+                    │         │                       │
+                    │         │                       ├── embed_tokens(input_ids)
+                    │         │                       └── MTPLayer.forward(embeds, hidden_states)
+                    │         │                               ├── enorm(embeds) + hnorm(hidden)
+                    │         │                               ├── eh_proj(concat)
+                    │         │                               └── mtp_block(transformer层)
+                    │         │
+                    │         └──→ 返回 new_hidden_states
+                    │
+                    ├──→ compute_logits(new_hidden_states)     # 这里会加载对应的mtp layer层以及共享的lm_head
+                    │         └──→ SharedHead.norm + head ──→ logits
+                    │                         # 这里做了两步操作：RMSNorm + Linear （hidden --> volcab_size)
+                    │
+                    ├──→ sample draft_token  
+                    │
+                    │  后续步: 用 MTP 自己的 hidden_states + draft_token (循环)  
+                    └──→ 重复 run_model → compute_logits → sample
+                          (共重复了 num_speculative_tokens-1 步,加上开头的1步一共num_speculative_tokens步)
 
 ```
 
 # 关于KVcache
+
 draft token 的 KV 不写入 prefix cache
 new tokens 包含 verified 和 unverified draft tokens，
 但只缓存 verified tokens（通过 request.num_tokens 来 cap）
 **注意num_computed_token是target model生成的KV**
-**draft model负责产生token，在多步前向的时候也会保存和服用KV**
+**draft model负责产生token，在多步draft前向的时候也会保存和复用KV**
 
 在propose_draft过程中，除了第0步输入 的token长度是变长的，后续进行前向的输入token长度都是1+上一步的hidden_state
 在后续步数中，，之前draft otken的KVcache是已经被保存的，因为在scheduler中显存已经申请了；
@@ -142,7 +212,6 @@ Scheduler._schedule_running_requests()
             └── prefix cache 只写入到 request.num_tokens（不含 draft）
                    ↑
                    确保被拒绝的 draft token 不污染 prefix cache
-
 
 ```
 
@@ -234,6 +303,32 @@ DeepSeek-V3 checkpoint 结构
 假设有多层的话，根据其实现逻辑，其embedding和shared_head还是只会共享一层；
 
 # 其他
+
+## 重复惩罚
+
+```
+举个例子
+假设模型正在生成一段文字，用户设置了 frequency_penalty=0.5，词表中有：
+
+token "the" (id=100)
+token "cat" (id=200)
+第1轮 decode → 采样出 "the"
+
+postprocess() 执行：
+  output_bin_counts[req][100] += 1   →  output_bin_counts[req][100] = 1
+第2轮 decode → 进入 sample() 前，先修改 logits：
+
+
+# _penalties_kernel 内：
+logit["the"] -= frequency_penalty * output_bin_counts[req][100]
+             = logit["the"] - 0.5 * 1
+             = logit["the"] - 0.5   ← 被压低了 0.5
+第3轮 "the" 又被选中，output_bin_counts[req][100] = 2，下一轮再压低 0.5×2=1.0。
+
+效果：越生成越难再被选中，防止模型陷入循环重复。
+```
+
+## 主要代码
 代码中的具体逻辑参考文件内注释，主要是：
 vllm/v1/worker/gpu/model_runner.py
 vllm/model_executor/models/deepseek_mtp.py
