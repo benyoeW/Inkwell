@@ -50,7 +50,7 @@ _process_engine_step：
 
 ```
 
-# draft token 生成阶段
+# draft token 验证与生成阶段
 ```
 调用链路总揽
 EngineCore.step()                         # 引擎核心
@@ -233,6 +233,7 @@ DeepSeek-V3 checkpoint 结构
 
 假设有多层的话，根据其实现逻辑，其embedding和shared_head还是只会共享一层；
 
+# 其他
 代码中的具体逻辑参考文件内注释，主要是：
 vllm/v1/worker/gpu/model_runner.py
 vllm/model_executor/models/deepseek_mtp.py

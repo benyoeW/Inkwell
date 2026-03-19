@@ -164,7 +164,7 @@ _process_engine_step：
   ...
 
 </code></pre>
-<h1>draft token 生成阶段</h1>
+<h1>draft token 验证与生成阶段</h1>
 <pre class="notranslate"><code class="notranslate">调用链路总揽
 EngineCore.step()                         # 引擎核心
   └─&gt; Executor.execute_model()            # 执行器 (UniProc/MultiProc/Ray)    ⭐️
@@ -333,6 +333,7 @@ Step 8: compute_logits
     └── self_attn.*, mlp.*             ← 独立的 MTP Transformer block 权重
 </code></pre>
 <p>假设有多层的话，根据其实现逻辑，其embedding和shared_head还是只会共享一层；</p>
+<h1>其他</h1>
 <p>代码中的具体逻辑参考文件内注释，主要是：<br>
 vllm/v1/worker/gpu/model_runner.py<br>
 vllm/model_executor/models/deepseek_mtp.py<br>
