@@ -287,6 +287,81 @@ _process_engine_step：
                           (共重复了 num_speculative_tokens-1 步,加上开头的1步一共num_speculative_tokens步)
 
 </code></pre>
+<h1>prefill的draft 前向</h1>
+<p>请求输入序列长度：5（tokens: t0, t1, t2, t3, t4）<br>
+Target model prefill 后采样得到：t5<br>
+Hidden size（H）：假设 4096<br>
+Draft model 前向的实际输入（已经过 prepare_eagle_inputs 右移）：<br>
+eagle_input_ids = [t1, t2, t3, t4, t5]，shape [5]<br>
+eagle_hidden_states（来自 target model 每个位置的输出），shape [5, 4096]</p>
+<p>Step 1：Token Embedding</p>
+<pre class="notranslate"><code class="notranslate">input_ids:      [t1, t2, t3, t4, t5]     shape: [5]
+       ↓ embed_tokens（词表查找）
+inputs_embeds:                            shape: [5, 4096]
+</code></pre>
+<p>Step 2：Mask position=0 的位置（MTP 特有）</p>
+<pre class="notranslate"><code class="notranslate">inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
+对 position=0 的 token 的 embedding 置零（因为 position 0 的语义信息已经由 previous_hidden_states 携带，不需要重复），这是 MTP 的特殊设计：
+
+positions:      [0, 1, 2, 3, 4]          shape: [5]
+inputs_embeds:  [0, e1, e2, e3, e4]      shape: [5, 4096]  ← position=0处被置零
+</code></pre>
+<p>Step 3：分别 RMSNorm + Concat + 线性投影</p>
+<pre class="notranslate"><code class="notranslate">inputs_embeds:         [0, e1, e2, e3, e4]     shape: [5, 4096]
+       ↓ enorm（RMSNorm）
+inputs_embeds_normed:                           shape: [5, 4096]
+
+previous_hidden_states: [h0, h1, h2, h3, h4]   shape: [5, 4096]
+       ↓ hnorm（RMSNorm）
+hidden_states_normed:                           shape: [5, 4096]
+
+       ↓ torch.cat([inputs_embeds_normed, hidden_states_normed], dim=-1)
+concatenated:                                   shape: [5, 8192]  ← 2*H
+
+       ↓ eh_proj（Linear: 8192 → 4096）
+hidden_states:                                  shape: [5, 4096]  ← 压回 H
+</code></pre>
+<p>Step 4：经过一个完整的 Decoder Layer（Attention + FFN）</p>
+<pre class="notranslate"><code class="notranslate">hidden_states:  shape: [5, 4096]
+       ↓ DeepseekV2DecoderLayer
+         ├─ RMSNorm
+         ├─ MLA / MHA Attention（KV cache 参与计算）
+         │    Q: [5, num_heads, head_dim]
+         │    K/V: 来自 KV cache（历史tokens）+ 当前5个token新增
+         │    attn_output: [5, 4096]
+         ├─ 残差连接
+         ├─ RMSNorm
+         ├─ MoE / FFN
+         └─ 残差连接
+       ↓
+hidden_states:  shape: [5, 4096]   ← 维度不变
+</code></pre>
+<p>Step 5：取最后一个位置计算 logits，采样第一个 draft token</p>
+<pre class="notranslate"><code class="notranslate">sample_hidden_states = last_hidden_states[last_token_indices]
+logits = self.model.compute_logits(sample_hidden_states)
+
+last_hidden_states:         shape: [5, 4096]
+       ↓ 取 last_token_indices（每个请求最后一个有效位置，这里是 index=4）
+sample_hidden_states:       shape: [1, 4096]   ← 只取最后1个位置
+
+       ↓ RMSNorm + lm_head（Linear: 4096 → vocab_size）
+logits:                     shape: [1, vocab_size]
+
+       ↓ gumbel_sample 采样
+draft_token_0 = t6          shape: [1]         ← 第0个 draft token
+</code></pre>
+<h3>Decode 阶段对比（每次draft前向）</h3>
+<pre class="notranslate"><code class="notranslate">调用 prepare_eagle_decode 后，每个请求只保留 1个 token + 1个 hidden_state：
+
+
+input_ids:          [t6]           shape: [1]
+hidden_states:      [h4]           shape: [1, 4096]  ← 取上一步 last_token 位置的 hidden_state
+
+Step 1: embed(t6)                  shape: [1, 4096]
+Step 2: enorm + hnorm + cat        shape: [1, 8192]
+Step 3: eh_proj                    shape: [1, 4096]
+Step 4: Decoder Layer              shape: [1, 4096]
+</code></pre>
 <h1>关于KVcache</h1>
 <p>draft token 的 KV 不写入 prefix cache<br>
 new tokens 包含 verified 和 unverified draft tokens，<br>
