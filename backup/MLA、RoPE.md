@@ -17,6 +17,11 @@ K也是由两部分拼接而成，一部分带有RoPE，一部分没有；
 
 V直接由latent ctkv经过上采样的到V
 
+
+<img width="2114" height="816" alt="Image" src="https://github.com/user-attachments/assets/062ea847-3529-4e93-9b56-f53885ab6d7a" />
+如图，这里的
+Q的Rope是通过latent C再经过一个权重矩阵得到一个向量之后，再进行Rope；
+K的Rope是直接由sequence的隐藏信息经过一个权重得到特征向量再进行Rope；且是多头共享的位置特征；
 # 代码实现：
 
 

@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Xa Inkwell</title><link>https://benyoeW.github.io/Inkwell</link><description>daily learning &amp; working</description><copyright>Xa Inkwell</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://benyoeW.github.io/Inkwell</link></image><lastBuildDate>Thu, 19 Mar 2026 17:05:38 +0000</lastBuildDate><managingEditor>Xa Inkwell</managingEditor><ttl>60</ttl><webMaster>Xa Inkwell</webMaster><item><title>【vllm】DeepSeekMTP、eagle</title><link>https://benyoeW.github.io/Inkwell/post/%E3%80%90vllm%E3%80%91DeepSeekMTP%E3%80%81eagle.html</link><description># 全局整体调用逻辑：
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Xa Inkwell</title><link>https://benyoeW.github.io/Inkwell</link><description>daily learning &amp; working</description><copyright>Xa Inkwell</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://benyoeW.github.io/Inkwell</link></image><lastBuildDate>Fri, 20 Mar 2026 02:13:53 +0000</lastBuildDate><managingEditor>Xa Inkwell</managingEditor><ttl>60</ttl><webMaster>Xa Inkwell</webMaster><item><title>【vllm】DeepSeekMTP、eagle</title><link>https://benyoeW.github.io/Inkwell/post/%E3%80%90vllm%E3%80%91DeepSeekMTP%E3%80%81eagle.html</link><description># 全局整体调用逻辑：
 ```
 run_busy_loop()
   ├─ _process_input_queue()   ← 从 input_queue 读取新请求/abort     # 将请求传输到引擎侧，然后执行下面的函数
@@ -35,6 +35,11 @@ K也是由两部分拼接而成，一部分带有RoPE，一部分没有；
 
 V直接由latent ctkv经过上采样的到V
 
+
+&lt;img width='2114' height='816' alt='Image' src='https://github.com/user-attachments/assets/062ea847-3529-4e93-9b56-f53885ab6d7a' /&gt;
+如图，这里的
+Q的Rope是通过latent C再经过一个权重矩阵得到一个向量之后，再进行Rope；
+K的Rope是直接由sequence的隐藏信息经过一个权重得到特征向量再进行Rope；且是多头共享的位置特征；
 # 代码实现：
 
 
