@@ -587,7 +587,7 @@ int main()
 <meta property="og:url" content="https://benyoeW.github.io/Inkwell/post/gpu%20coding%26arch.html">
 <meta property="og:image" content="https://github.githubassets.com/favicons/favicon.svg">
 <title>gpu coding&arch</title>
-
+<link href="//unpkg.com/@wooorm/starry-night@2.1.1/style/both.css" rel="stylesheet" />
 
 
 </head>
@@ -611,7 +611,17 @@ body{box-sizing: border-box;min-width: 200px;max-width: 900px;margin: 20px auto;
     body {padding: 8px;}
     .postTitle{font-size:24px;}
 }
-
+.copy-feedback {
+    display: none;
+    position: absolute;
+    top: 10px;
+    right: 50px;
+    color: var(--color-fg-on-emphasis);
+    background-color: var(--color-fg-muted);
+    border-radius: 3px;
+    padding: 5px 8px;
+    font-size: 12px;
+}
 </style>
 
 
@@ -644,288 +654,286 @@ body{box-sizing: border-box;min-width: 200px;max-width: 900px;margin: 20px auto;
 </div>
     <div id="content">
 <div class="markdown-body" id="postBody"><h1>gemm</h1>
-<pre lang="c++" class="notranslate"><code class="notranslate">#include &lt;cuda_runtime.h&gt;
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
+<div class="highlight highlight-source-c++"><pre class="notranslate">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>cuda_runtime.h<span class="pl-pds">&gt;</span></span>
+#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>stdio.h<span class="pl-pds">&gt;</span></span>
+#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>stdlib.h<span class="pl-pds">&gt;</span></span>
 
-# define BLOCKSIZE 16
+# <span class="pl-k">define</span> <span class="pl-en">BLOCKSIZE</span> <span class="pl-c1">16</span>
 
-__global__ void gemm_kernel_tile(const float* __restrict__ a,
-                                  const float* __restrict__ b,
-                                  float* __restrict__ c,
-                                  int M, int N, int K){
+__global__ <span class="pl-k">void</span> <span class="pl-en">gemm_kernel_tile</span>(<span class="pl-k">const</span> <span class="pl-k">float</span>* __restrict__ a,
+                                  <span class="pl-k">const</span> <span class="pl-k">float</span>* __restrict__ b,
+                                  <span class="pl-k">float</span>* __restrict__ c,
+                                  <span class="pl-k">int</span> M, <span class="pl-k">int</span> N, <span class="pl-k">int</span> K){
                                 
-                                int y = blockIdx.y * blockDim.y + threadIdx.y;
-                                int x = blockIdx.x * blockDim.x + threadIdx.x;
+                                <span class="pl-k">int</span> y = blockIdx.<span class="pl-smi">y</span> * blockDim.<span class="pl-smi">y</span> + threadIdx.<span class="pl-smi">y</span>;
+                                <span class="pl-k">int</span> x = blockIdx.<span class="pl-smi">x</span> * blockDim.<span class="pl-smi">x</span> + threadIdx.<span class="pl-smi">x</span>;
                                 
-                                __shared__ float a_tile[BLOCKSIZE][BLOCKSIZE], b_tile[BLOCKSIZE][BLOCKSIZE];
+                                __shared__ <span class="pl-k">float</span> a_tile[BLOCKSIZE][BLOCKSIZE], b_tile[BLOCKSIZE][BLOCKSIZE];
                                 
-                                float sum = 0.0f;
+                                <span class="pl-k">float</span> sum = <span class="pl-c1">0</span>.<span class="pl-c1">0f</span>;
 
-                                for(int i=0;i&lt;K/BLOCKSIZE;++i){
-                                    // load to sahared memory a
-                                    int ax = threadIdx.x + i * BLOCKSIZE;
-                                    int ay = y;
-                                    if(ax &lt; K &amp;&amp; ay &lt; M){
-                                        a_tile[threadIdx.y][threadIdx.x] = a[ay * K + ax];   // ⭐️ 防止共享内存坐标越界
-                                    }else{
-                                        a_tile[threadIdx.y][threadIdx.x] = 0.0f;
+                                <span class="pl-k">for</span>(<span class="pl-k">int</span> i=<span class="pl-c1">0</span>;i&lt;K/BLOCKSIZE;++i){
+                                    <span class="pl-c"><span class="pl-c">//</span> load to sahared memory a</span>
+                                    <span class="pl-k">int</span> ax = threadIdx.<span class="pl-smi">x</span> + i * BLOCKSIZE;
+                                    <span class="pl-k">int</span> ay = y;
+                                    <span class="pl-k">if</span>(ax &lt; K &amp;&amp; ay &lt; M){
+                                        a_tile[threadIdx.<span class="pl-smi">y</span>][threadIdx.<span class="pl-smi">x</span>] = a[ay * K + ax];   <span class="pl-c"><span class="pl-c">//</span> ⭐️ 防止共享内存坐标越界</span>
+                                    }<span class="pl-k">else</span>{
+                                        a_tile[threadIdx.<span class="pl-smi">y</span>][threadIdx.<span class="pl-smi">x</span>] = <span class="pl-c1">0</span>.<span class="pl-c1">0f</span>;
                                     }
-                                    // load to sahared memory b
-                                    int bx = threadIdx.x;
-                                    int by = threadIdx.y + i * BLOCKSIZE;
-                                    if(bx &lt; N &amp;&amp; by &lt; K){
-                                        b_tile[threadIdx.y][threadIdx.x] = b[by * N + bx];
-                                    }else{
-                                        b_tile[threadIdx.y][threadIdx.x] = 0.0f;
+                                    <span class="pl-c"><span class="pl-c">//</span> load to sahared memory b</span>
+                                    <span class="pl-k">int</span> bx = threadIdx.<span class="pl-smi">x</span>;
+                                    <span class="pl-k">int</span> by = threadIdx.<span class="pl-smi">y</span> + i * BLOCKSIZE;
+                                    <span class="pl-k">if</span>(bx &lt; N &amp;&amp; by &lt; K){
+                                        b_tile[threadIdx.<span class="pl-smi">y</span>][threadIdx.<span class="pl-smi">x</span>] = b[by * N + bx];
+                                    }<span class="pl-k">else</span>{
+                                        b_tile[threadIdx.<span class="pl-smi">y</span>][threadIdx.<span class="pl-smi">x</span>] = <span class="pl-c1">0</span>.<span class="pl-c1">0f</span>;
                                     }
 
-                                    __syncthreads();  // ⭐️ 数据加载完成之后同步
+                                    <span class="pl-c1">__syncthreads</span>();  <span class="pl-c"><span class="pl-c">//</span> ⭐️ 数据加载完成之后同步</span>
 
                                     
-                                    for(int i=0;i&lt;BLOCKSIZE;++i){
-                                        sum += a_tile[threadIdx.y][i] * b_tile[i][threadIdx.x];
+                                    <span class="pl-k">for</span>(<span class="pl-k">int</span> i=<span class="pl-c1">0</span>;i&lt;BLOCKSIZE;++i){
+                                        sum += a_tile[threadIdx.<span class="pl-smi">y</span>][i] * b_tile[i][threadIdx.<span class="pl-smi">x</span>];
                                     }
-                                    __syncthreads();  // ⭐️ 同步，防止提前进入下一轮计算然后累加错误
+                                    <span class="pl-c1">__syncthreads</span>();  <span class="pl-c"><span class="pl-c">//</span> ⭐️ 同步，防止提前进入下一轮计算然后累加错误</span>
                                 }
-                                if(x &lt; N &amp;&amp; y &lt; M){
+                                <span class="pl-k">if</span>(x &lt; N &amp;&amp; y &lt; M){
                                     c[y * N + x] = sum;
                                 }
                             }
                                     
 
 
-__global__ void gemm_kernel(const float* __restrict__ a,
-                            const float* __restrict__ b,
-                            float* __restrict__ c,
-                            int M, int N, int K) {
-    // Each thread computes one element of C
-    int row = blockIdx.y * blockDim.y + threadIdx.y; // y -&gt; row in C (0..M-1)
-    int col = blockIdx.x * blockDim.x + threadIdx.x; // x -&gt; col in C (0..N-1)
+__global__ <span class="pl-k">void</span> <span class="pl-en">gemm_kernel</span>(<span class="pl-k">const</span> <span class="pl-k">float</span>* __restrict__ a,
+                            <span class="pl-k">const</span> <span class="pl-k">float</span>* __restrict__ b,
+                            <span class="pl-k">float</span>* __restrict__ c,
+                            <span class="pl-k">int</span> M, <span class="pl-k">int</span> N, <span class="pl-k">int</span> K) {
+    <span class="pl-c"><span class="pl-c">//</span> Each thread computes one element of C</span>
+    <span class="pl-k">int</span> row = blockIdx.<span class="pl-smi">y</span> * blockDim.<span class="pl-smi">y</span> + threadIdx.<span class="pl-smi">y</span>; <span class="pl-c"><span class="pl-c">//</span> y -&gt; row in C (0..M-1)</span>
+    <span class="pl-k">int</span> col = blockIdx.<span class="pl-smi">x</span> * blockDim.<span class="pl-smi">x</span> + threadIdx.<span class="pl-smi">x</span>; <span class="pl-c"><span class="pl-c">//</span> x -&gt; col in C (0..N-1)</span>
 
-    if (row &lt; M &amp;&amp; col &lt; N) {
-        float sum = 0.0f;
-        for (int k = 0; k &lt; K; ++k) {
-            // A[row][k] * B[k][col]
+    <span class="pl-k">if</span> (row &lt; M &amp;&amp; col &lt; N) {
+        <span class="pl-k">float</span> sum = <span class="pl-c1">0</span>.<span class="pl-c1">0f</span>;
+        <span class="pl-k">for</span> (<span class="pl-k">int</span> k = <span class="pl-c1">0</span>; k &lt; K; ++k) {
+            <span class="pl-c"><span class="pl-c">//</span> A[row][k] * B[k][col]</span>
             sum += a[row * K + k] * b[k * N + col];
         }
         c[row * N + col] = sum;
     }
 }
 
-int main() {
-    // Matrix dimensions: A(MxK) * B(KxN) = C(MxN)
-    const int M = 5000;
-    const int K = 6000;
-    const int N = 4000;
+<span class="pl-k">int</span> <span class="pl-en">main</span>() {
+    <span class="pl-c"><span class="pl-c">//</span> Matrix dimensions: A(MxK) * B(KxN) = C(MxN)</span>
+    <span class="pl-k">const</span> <span class="pl-k">int</span> M = <span class="pl-c1">5000</span>;
+    <span class="pl-k">const</span> <span class="pl-k">int</span> K = <span class="pl-c1">6000</span>;
+    <span class="pl-k">const</span> <span class="pl-k">int</span> N = <span class="pl-c1">4000</span>;
 
-    const size_t size_a = M * K * sizeof(float);
-    const size_t size_b = K * N * sizeof(float);
-    const size_t size_c = M * N * sizeof(float);
+    <span class="pl-k">const</span> <span class="pl-c1">size_t</span> size_a = M * K * <span class="pl-k">sizeof</span>(<span class="pl-k">float</span>);
+    <span class="pl-k">const</span> <span class="pl-c1">size_t</span> size_b = K * N * <span class="pl-k">sizeof</span>(<span class="pl-k">float</span>);
+    <span class="pl-k">const</span> <span class="pl-c1">size_t</span> size_c = M * N * <span class="pl-k">sizeof</span>(<span class="pl-k">float</span>);
 
-    // Host memory allocation
-    float *h_a = (float*)malloc(size_a);
-    float *h_b = (float*)malloc(size_b);
-    float *h_c = (float*)malloc(size_c);
-    float *h_c_ref = (float*)malloc(size_c); // Optional: CPU reference
+    <span class="pl-c"><span class="pl-c">//</span> Host memory allocation</span>
+    <span class="pl-k">float</span> *h_a = (<span class="pl-k">float</span>*)<span class="pl-c1">malloc</span>(size_a);
+    <span class="pl-k">float</span> *h_b = (<span class="pl-k">float</span>*)<span class="pl-c1">malloc</span>(size_b);
+    <span class="pl-k">float</span> *h_c = (<span class="pl-k">float</span>*)<span class="pl-c1">malloc</span>(size_c);
+    <span class="pl-k">float</span> *h_c_ref = (<span class="pl-k">float</span>*)<span class="pl-c1">malloc</span>(size_c); <span class="pl-c"><span class="pl-c">//</span> Optional: CPU reference</span>
 
-    // Initialize host matrices
-    for (int i = 0; i &lt; M * K; ++i) h_a[i] = 1.0f; // A all 1s
-    for (int i = 0; i &lt; K * N; ++i) h_b[i] = 2.0f; // B all 2s
-    for (int i = 0; i &lt; M * N; ++i) h_c[i] = 0.0f; // Initialize to 0
+    <span class="pl-c"><span class="pl-c">//</span> Initialize host matrices</span>
+    <span class="pl-k">for</span> (<span class="pl-k">int</span> i = <span class="pl-c1">0</span>; i &lt; M * K; ++i) h_a[i] = <span class="pl-c1">1</span>.<span class="pl-c1">0f</span>; <span class="pl-c"><span class="pl-c">//</span> A all 1s</span>
+    <span class="pl-k">for</span> (<span class="pl-k">int</span> i = <span class="pl-c1">0</span>; i &lt; K * N; ++i) h_b[i] = <span class="pl-c1">2</span>.<span class="pl-c1">0f</span>; <span class="pl-c"><span class="pl-c">//</span> B all 2s</span>
+    <span class="pl-k">for</span> (<span class="pl-k">int</span> i = <span class="pl-c1">0</span>; i &lt; M * N; ++i) h_c[i] = <span class="pl-c1">0</span>.<span class="pl-c1">0f</span>; <span class="pl-c"><span class="pl-c">//</span> Initialize to 0</span>
 
-    // Device memory allocation
-    float *d_a, *d_b, *d_c;
+    <span class="pl-c"><span class="pl-c">//</span> Device memory allocation</span>
+    <span class="pl-k">float</span> *d_a, *d_b, *d_c;
     cudaError_t err;
 
-    err = cudaMalloc(&amp;d_a, size_a);
-    if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_a failed: %s\n", cudaGetErrorString(err)); return 1; }
+    err = <span class="pl-c1">cudaMalloc</span>(&amp;d_a, size_a);
+    <span class="pl-k">if</span> (err != cudaSuccess) { <span class="pl-c1">fprintf</span>(stderr, <span class="pl-s"><span class="pl-pds">"</span>cudaMalloc d_a failed: %s<span class="pl-cce">\n</span><span class="pl-pds">"</span></span>, <span class="pl-c1">cudaGetErrorString</span>(err)); <span class="pl-k">return</span> <span class="pl-c1">1</span>; }
 
-    err = cudaMalloc(&amp;d_b, size_b);
-    if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_b failed: %s\n", cudaGetErrorString(err)); return 1; }
+    err = <span class="pl-c1">cudaMalloc</span>(&amp;d_b, size_b);
+    <span class="pl-k">if</span> (err != cudaSuccess) { <span class="pl-c1">fprintf</span>(stderr, <span class="pl-s"><span class="pl-pds">"</span>cudaMalloc d_b failed: %s<span class="pl-cce">\n</span><span class="pl-pds">"</span></span>, <span class="pl-c1">cudaGetErrorString</span>(err)); <span class="pl-k">return</span> <span class="pl-c1">1</span>; }
 
-    err = cudaMalloc(&amp;d_c, size_c);
-    if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_c failed: %s\n", cudaGetErrorString(err)); return 1; }
+    err = <span class="pl-c1">cudaMalloc</span>(&amp;d_c, size_c);
+    <span class="pl-k">if</span> (err != cudaSuccess) { <span class="pl-c1">fprintf</span>(stderr, <span class="pl-s"><span class="pl-pds">"</span>cudaMalloc d_c failed: %s<span class="pl-cce">\n</span><span class="pl-pds">"</span></span>, <span class="pl-c1">cudaGetErrorString</span>(err)); <span class="pl-k">return</span> <span class="pl-c1">1</span>; }
 
-    // Copy data from host to device
-    cudaMemcpy(d_a, h_a, size_a, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b, h_b, size_b, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_c, h_c, size_c, cudaMemcpyHostToDevice);
+    <span class="pl-c"><span class="pl-c">//</span> Copy data from host to device</span>
+    <span class="pl-c1">cudaMemcpy</span>(d_a, h_a, size_a, cudaMemcpyHostToDevice);
+    <span class="pl-c1">cudaMemcpy</span>(d_b, h_b, size_b, cudaMemcpyHostToDevice);
+    <span class="pl-c1">cudaMemcpy</span>(d_c, h_c, size_c, cudaMemcpyHostToDevice);
 
-    // Kernel launch configuration
-    dim3 blockSize(16, 16); // 256 threads per block
-    dim3 gridSize((N + blockSize.x - 1) / blockSize.x,
-                  (M + blockSize.y - 1) / blockSize.y);
+    <span class="pl-c"><span class="pl-c">//</span> Kernel launch configuration</span>
+    dim3 <span class="pl-smi">blockSize</span>(<span class="pl-c1">16</span>, <span class="pl-c1">16</span>); <span class="pl-c"><span class="pl-c">//</span> 256 threads per block</span>
+    dim3 <span class="pl-smi">gridSize</span>((N + blockSize.<span class="pl-smi">x</span> - <span class="pl-c1">1</span>) / blockSize.<span class="pl-smi">x</span>,
+                  (M + blockSize.<span class="pl-smi">y</span> - <span class="pl-c1">1</span>) / blockSize.<span class="pl-smi">y</span>);
 
-    // Launch kernel
+    <span class="pl-c"><span class="pl-c">//</span> Launch kernel</span>
     gemm_kernel_tile&lt;&lt;&lt;gridSize, blockSize&gt;&gt;&gt;(d_a, d_b, d_c, M, N, K);
 
-    // Check for kernel launch errors
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(err));
-        return 1;
+    <span class="pl-c"><span class="pl-c">//</span> Check for kernel launch errors</span>
+    err = <span class="pl-c1">cudaGetLastError</span>();
+    <span class="pl-k">if</span> (err != cudaSuccess) {
+        <span class="pl-c1">fprintf</span>(stderr, <span class="pl-s"><span class="pl-pds">"</span>Kernel launch failed: %s<span class="pl-cce">\n</span><span class="pl-pds">"</span></span>, <span class="pl-c1">cudaGetErrorString</span>(err));
+        <span class="pl-k">return</span> <span class="pl-c1">1</span>;
     }
 
-    // Wait for GPU to finish
-    cudaDeviceSynchronize();
+    <span class="pl-c"><span class="pl-c">//</span> Wait for GPU to finish</span>
+    <span class="pl-c1">cudaDeviceSynchronize</span>();
 
-    // Copy result back to host
-    cudaMemcpy(h_c, d_c, size_c, cudaMemcpyDeviceToHost);
+    <span class="pl-c"><span class="pl-c">//</span> Copy result back to host</span>
+    <span class="pl-c1">cudaMemcpy</span>(h_c, d_c, size_c, cudaMemcpyDeviceToHost);
 
-    printf("First 10 elements of C (row 0, columns 0～9):\n");
-    for (int i = 0; i &lt; 10 &amp;&amp; i &lt; N; ++i) {
-        printf("C[0][%d] = %.2f\n", i, h_c[i]);
+    <span class="pl-c1">printf</span>(<span class="pl-s"><span class="pl-pds">"</span>First 10 elements of C (row 0, columns 0～9):<span class="pl-cce">\n</span><span class="pl-pds">"</span></span>);
+    <span class="pl-k">for</span> (<span class="pl-k">int</span> i = <span class="pl-c1">0</span>; i &lt; <span class="pl-c1">10</span> &amp;&amp; i &lt; N; ++i) {
+        <span class="pl-c1">printf</span>(<span class="pl-s"><span class="pl-pds">"</span>C[0][%d] = %.2f<span class="pl-cce">\n</span><span class="pl-pds">"</span></span>, i, h_c[i]);
     }
-    printf("\n");
+    <span class="pl-c1">printf</span>(<span class="pl-s"><span class="pl-pds">"</span><span class="pl-cce">\n</span><span class="pl-pds">"</span></span>);
 
-    // Optional: Verify result (C should be all 2*K = 400.0f)
-    bool correct = true;
-    float expected = 2.0f * K; // since A=1, B=2, sum over K terms: 1*2*K
-    for (int i = 0; i &lt; M * N; ++i) {
-        if (abs(h_c[i] - expected) &gt; 1e-5) {
-            correct = false;
-            break;
+    <span class="pl-c"><span class="pl-c">//</span> Optional: Verify result (C should be all 2*K = 400.0f)</span>
+    <span class="pl-k">bool</span> correct = <span class="pl-c1">true</span>;
+    <span class="pl-k">float</span> expected = <span class="pl-c1">2</span>.<span class="pl-c1">0f</span> * K; <span class="pl-c"><span class="pl-c">//</span> since A=1, B=2, sum over K terms: 1*2*K</span>
+    <span class="pl-k">for</span> (<span class="pl-k">int</span> i = <span class="pl-c1">0</span>; i &lt; M * N; ++i) {
+        <span class="pl-k">if</span> (<span class="pl-c1">abs</span>(h_c[i] - expected) &gt; <span class="pl-c1">1e-5</span>) {
+            correct = <span class="pl-c1">false</span>;
+            <span class="pl-k">break</span>;
         }
     }
 
-    printf("Matrix multiplication result: %s\n", correct ? "PASSED" : "FAILED");
-    if (!correct) {
-        printf("Example: h_c[0] = %f, expected = %f\n", h_c[0], expected);
+    <span class="pl-c1">printf</span>(<span class="pl-s"><span class="pl-pds">"</span>Matrix multiplication result: %s<span class="pl-cce">\n</span><span class="pl-pds">"</span></span>, correct ? <span class="pl-s"><span class="pl-pds">"</span>PASSED<span class="pl-pds">"</span></span> : <span class="pl-s"><span class="pl-pds">"</span>FAILED<span class="pl-pds">"</span></span>);
+    <span class="pl-k">if</span> (!correct) {
+        <span class="pl-c1">printf</span>(<span class="pl-s"><span class="pl-pds">"</span>Example: h_c[0] = %f, expected = %f<span class="pl-cce">\n</span><span class="pl-pds">"</span></span>, h_c[<span class="pl-c1">0</span>], expected);
     }
 
-    // Cleanup
-    free(h_a); free(h_b); free(h_c); free(h_c_ref);
-    cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
-    // no
-    return 0;
+    <span class="pl-c"><span class="pl-c">//</span> Cleanup</span>
+    <span class="pl-c1">free</span>(h_a); <span class="pl-c1">free</span>(h_b); <span class="pl-c1">free</span>(h_c); <span class="pl-c1">free</span>(h_c_ref);
+    <span class="pl-c1">cudaFree</span>(d_a); <span class="pl-c1">cudaFree</span>(d_b); <span class="pl-c1">cudaFree</span>(d_c);
+    <span class="pl-c"><span class="pl-c">//</span> no</span>
+    <span class="pl-k">return</span> <span class="pl-c1">0</span>;
 }
-
-</code></pre>
+</pre></div>
 <h1>transpose</h1>
-<pre lang="c++" class="notranslate"><code class="notranslate"># include &lt;stdio.h&gt;
-# include &lt;math.h&gt;
+<div class="highlight highlight-source-c++"><pre class="notranslate"># <span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>stdio.h<span class="pl-pds">&gt;</span></span>
+# <span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>math.h<span class="pl-pds">&gt;</span></span>
 
-#define BLOCK_SIZE 32
-#define M 3000
-#define N 1000
+#<span class="pl-k">define</span> <span class="pl-en">BLOCK_SIZE</span> <span class="pl-c1">32</span>
+#<span class="pl-k">define</span> <span class="pl-en">M</span> <span class="pl-c1">3000</span>
+#<span class="pl-k">define</span> <span class="pl-en">N</span> <span class="pl-c1">1000</span>
 
-__managed__ int matrix[N][M];
-__managed__ int gpu_result[M][N];
-__managed__ int cpu_result[M][N];
+__managed__ <span class="pl-k">int</span> matrix[N][M];
+__managed__ <span class="pl-k">int</span> gpu_result[M][N];
+__managed__ <span class="pl-k">int</span> cpu_result[M][N];
 
-__global__ void gpu_matrix_transpose(int in[N][M], int out[M][N])
+__global__ <span class="pl-k">void</span> <span class="pl-en">gpu_matrix_transpose</span>(<span class="pl-k">int</span> in[N][M], <span class="pl-k">int</span> out[M][N])
 {
-    int x = threadIdx.x + blockDim.x * blockIdx.x;
-    int y = threadIdx.y + blockDim.y * blockIdx.y;
+    <span class="pl-k">int</span> x = threadIdx.<span class="pl-smi">x</span> + blockDim.<span class="pl-smi">x</span> * blockIdx.<span class="pl-smi">x</span>;
+    <span class="pl-k">int</span> y = threadIdx.<span class="pl-smi">y</span> + blockDim.<span class="pl-smi">y</span> * blockIdx.<span class="pl-smi">y</span>;
 
-    if( x &lt; M &amp;&amp; y &lt; N)
+    <span class="pl-k">if</span>( x &lt; M &amp;&amp; y &lt; N)
     {
         out[x][y] = in[y][x];
     }
 }
 
-// 创建m行，n列的线程数量【由多个线程块组成的】
-__global__ void gpu_shared_matrix_transpose(int in[N][M], int out[M][N])
+<span class="pl-c"><span class="pl-c">//</span> 创建m行，n列的线程数量【由多个线程块组成的】</span>
+__global__ <span class="pl-k">void</span> <span class="pl-en">gpu_shared_matrix_transpose</span>(<span class="pl-k">int</span> in[N][M], <span class="pl-k">int</span> out[M][N])
 {
 
-    int y = threadIdx.y + blockDim.y * blockIdx.y;
-    int x = threadIdx.x + blockDim.x * blockIdx.x;
+    <span class="pl-k">int</span> y = threadIdx.<span class="pl-smi">y</span> + blockDim.<span class="pl-smi">y</span> * blockIdx.<span class="pl-smi">y</span>;
+    <span class="pl-k">int</span> x = threadIdx.<span class="pl-smi">x</span> + blockDim.<span class="pl-smi">x</span> * blockIdx.<span class="pl-smi">x</span>;
 
-    __shared__ int ken[BLOCK_SIZE+1][BLOCK_SIZE+1];//ken[32] warp
+    __shared__ <span class="pl-k">int</span> ken[BLOCK_SIZE+<span class="pl-c1">1</span>][BLOCK_SIZE+<span class="pl-c1">1</span>];<span class="pl-c"><span class="pl-c">//</span>ken[32] warp</span>
 
-    // step1：
-    if(x &lt; M &amp;&amp; y &lt; N)
+    <span class="pl-c"><span class="pl-c">//</span> step1：</span>
+    <span class="pl-k">if</span>(x &lt; M &amp;&amp; y &lt; N)
     {   
-        // step1：读到共享内存
-        ken[threadIdx.y][threadIdx.x] = in[y][x];
+        <span class="pl-c"><span class="pl-c">//</span> step1：读到共享内存</span>
+        ken[threadIdx.<span class="pl-smi">y</span>][threadIdx.<span class="pl-smi">x</span>] = in[y][x];
     }
-    __syncthreads();
+    <span class="pl-c1">__syncthreads</span>();
 
-    // 原则：相邻的线程访问相邻的坐标
+    <span class="pl-c"><span class="pl-c">//</span> 原则：相邻的线程访问相邻的坐标</span>
 
-    // step2：  块反转，块内坐标不变
-    int x1 = threadIdx.x + blockDim.y * blockIdx.y;
-    int y1 = threadIdx.y + blockDim.x * blockIdx.x;
+    <span class="pl-c"><span class="pl-c">//</span> step2：  块反转，块内坐标不变</span>
+    <span class="pl-k">int</span> x1 = threadIdx.<span class="pl-smi">x</span> + blockDim.<span class="pl-smi">y</span> * blockIdx.<span class="pl-smi">y</span>;
+    <span class="pl-k">int</span> y1 = threadIdx.<span class="pl-smi">y</span> + blockDim.<span class="pl-smi">x</span> * blockIdx.<span class="pl-smi">x</span>;
     
-    if(x1 &lt; N &amp;&amp; y1 &lt; M)
+    <span class="pl-k">if</span>(x1 &lt; N &amp;&amp; y1 &lt; M)
     {
-    // step3：从共享内存读到输出数据
-        out[y1][x1] = ken[threadIdx.x][threadIdx.y];//32 bank
+    <span class="pl-c"><span class="pl-c">//</span> step3：从共享内存读到输出数据</span>
+        out[y1][x1] = ken[threadIdx.<span class="pl-smi">x</span>][threadIdx.<span class="pl-smi">y</span>];<span class="pl-c"><span class="pl-c">//</span>32 bank</span>
     }
 
 }
 
-void cpu_matrix_transpose(int in[N][M], int out[M][N])
+<span class="pl-k">void</span> <span class="pl-en">cpu_matrix_transpose</span>(<span class="pl-k">int</span> in[N][M], <span class="pl-k">int</span> out[M][N])
 {
-    for(int y = 0; y &lt; N; y++)
+    <span class="pl-k">for</span>(<span class="pl-k">int</span> y = <span class="pl-c1">0</span>; y &lt; N; y++)
     {
-        for(int x = 0; x &lt; M; x++)
+        <span class="pl-k">for</span>(<span class="pl-k">int</span> x = <span class="pl-c1">0</span>; x &lt; M; x++)
         {
             out[x][y] = in[y][x];
         }
     }
 }
 
-int main()
+<span class="pl-k">int</span> <span class="pl-en">main</span>()
 {
-    for(int y=0; y&lt;N; y++)
+    <span class="pl-k">for</span>(<span class="pl-k">int</span> y=<span class="pl-c1">0</span>; y&lt;N; y++)
     {
-        for(int x=0; x&lt;M; x++)
+        <span class="pl-k">for</span>(<span class="pl-k">int</span> x=<span class="pl-c1">0</span>; x&lt;M; x++)
         {
-            matrix[y][x] = rand()%1024;
+            matrix[y][x] = <span class="pl-c1">rand</span>()%<span class="pl-c1">1024</span>;
         }
     }
 
     cudaEvent_t start, stop_gpu, stop_cpu;
-    cudaEventCreate(&amp;start);
-    cudaEventCreate(&amp;stop_cpu);
-    cudaEventCreate(&amp;stop_gpu);
+    <span class="pl-c1">cudaEventCreate</span>(&amp;start);
+    <span class="pl-c1">cudaEventCreate</span>(&amp;stop_cpu);
+    <span class="pl-c1">cudaEventCreate</span>(&amp;stop_gpu);
 
-    cudaEventRecord(start);
-    cudaEventSynchronize(start);
+    <span class="pl-c1">cudaEventRecord</span>(start);
+    <span class="pl-c1">cudaEventSynchronize</span>(start);
 
-    dim3 dimGrid((M + BLOCK_SIZE - 1)/BLOCK_SIZE, (N + BLOCK_SIZE -1)/BLOCK_SIZE);
-    dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 <span class="pl-smi">dimGrid</span>((M + BLOCK_SIZE - <span class="pl-c1">1</span>)/BLOCK_SIZE, (N + BLOCK_SIZE -<span class="pl-c1">1</span>)/BLOCK_SIZE);
+    dim3 <span class="pl-smi">dimBlock</span>(BLOCK_SIZE, BLOCK_SIZE);
 
-    for(int i = 0; i &lt; 20; i++)
+    <span class="pl-k">for</span>(<span class="pl-k">int</span> i = <span class="pl-c1">0</span>; i &lt; <span class="pl-c1">20</span>; i++)
     {
-        // gpu_matrix_transpose&lt;&lt;&lt;dimGrid,dimBlock&gt;&gt;&gt;(matrix, gpu_result);
+        <span class="pl-c"><span class="pl-c">//</span> gpu_matrix_transpose&lt;&lt;&lt;dimGrid,dimBlock&gt;&gt;&gt;(matrix, gpu_result);</span>
         gpu_shared_matrix_transpose&lt;&lt;&lt;dimGrid,dimBlock&gt;&gt;&gt;(matrix, gpu_result);
-        cudaDeviceSynchronize();
+        <span class="pl-c1">cudaDeviceSynchronize</span>();
     }
 
-    cudaEventRecord(stop_gpu);
-    cudaEventSynchronize(stop_gpu);
+    <span class="pl-c1">cudaEventRecord</span>(stop_gpu);
+    <span class="pl-c1">cudaEventSynchronize</span>(stop_gpu);
 
-    cpu_matrix_transpose(matrix, cpu_result);
+    <span class="pl-c1">cpu_matrix_transpose</span>(matrix, cpu_result);
 
-    cudaEventRecord(stop_cpu);
-    cudaEventSynchronize(stop_cpu);
+    <span class="pl-c1">cudaEventRecord</span>(stop_cpu);
+    <span class="pl-c1">cudaEventSynchronize</span>(stop_cpu);
 
-    float time_cpu, time_gpu;
-    cudaEventElapsedTime(&amp;time_gpu, start, stop_gpu);
-    cudaEventElapsedTime(&amp;time_cpu, stop_gpu, stop_cpu);
+    <span class="pl-k">float</span> time_cpu, time_gpu;
+    <span class="pl-c1">cudaEventElapsedTime</span>(&amp;time_gpu, start, stop_gpu);
+    <span class="pl-c1">cudaEventElapsedTime</span>(&amp;time_cpu, stop_gpu, stop_cpu);
 
-    bool errors = false;
-    for(int y = 0; y&lt;M; y++)
+    <span class="pl-k">bool</span> errors = <span class="pl-c1">false</span>;
+    <span class="pl-k">for</span>(<span class="pl-k">int</span> y = <span class="pl-c1">0</span>; y&lt;M; y++)
     {
-        for (int x = 0; x &lt; N; x++)
+        <span class="pl-k">for</span> (<span class="pl-k">int</span> x = <span class="pl-c1">0</span>; x &lt; N; x++)
         {
-            if(fabs(cpu_result[y][x] - gpu_result[y][x]) &gt; (1.0e-10))
+            <span class="pl-k">if</span>(<span class="pl-c1">fabs</span>(cpu_result[y][x] - gpu_result[y][x]) &gt; (<span class="pl-c1">1.0e-10</span>))
             {
-                errors = true;
+                errors = <span class="pl-c1">true</span>;
             }
         }
         
     }
 
-    printf("Result: %s\n", errors?"Error":"Pass");
-    printf("CPU time: %.2f\nGPU time: %.2f\n", time_cpu, time_gpu/20.0);
+    <span class="pl-c1">printf</span>(<span class="pl-s"><span class="pl-pds">"</span>Result: %s<span class="pl-cce">\n</span><span class="pl-pds">"</span></span>, errors?<span class="pl-s"><span class="pl-pds">"</span>Error<span class="pl-pds">"</span></span>:<span class="pl-s"><span class="pl-pds">"</span>Pass<span class="pl-pds">"</span></span>);
+    <span class="pl-c1">printf</span>(<span class="pl-s"><span class="pl-pds">"</span>CPU time: %.2f<span class="pl-cce">\n</span>GPU time: %.2f<span class="pl-cce">\n</span><span class="pl-pds">"</span></span>, time_cpu, time_gpu/<span class="pl-c1">20.0</span>);
 
-    return 0;
-}
-</code></pre></div>
+    <span class="pl-k">return</span> <span class="pl-c1">0</span>;
+}</pre></div></div>
 <div style="font-size:small;margin-top:8px;float:right;"></div>
 
 <button class="btn btn-block" type="button" onclick="openComments()" id="cmButton">评论</button>
@@ -950,7 +958,7 @@ if(""!=""){
 </script></div>
 </body>
 <script>
-var IconList={'sun': 'M8 10.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM8 12a4 4 0 100-8 4 4 0 000 8zM8 0a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0V.75A.75.75 0 018 0zm0 13a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 018 13zM2.343 2.343a.75.75 0 011.061 0l1.06 1.061a.75.75 0 01-1.06 1.06l-1.06-1.06a.75.75 0 010-1.06zm9.193 9.193a.75.75 0 011.06 0l1.061 1.06a.75.75 0 01-1.06 1.061l-1.061-1.06a.75.75 0 010-1.061zM16 8a.75.75 0 01-.75.75h-1.5a.75.75 0 010-1.5h1.5A.75.75 0 0116 8zM3 8a.75.75 0 01-.75.75H.75a.75.75 0 010-1.5h1.5A.75.75 0 013 8zm10.657-5.657a.75.75 0 010 1.061l-1.061 1.06a.75.75 0 11-1.06-1.06l1.06-1.06a.75.75 0 011.06 0zm-9.193 9.193a.75.75 0 010 1.06l-1.06 1.061a.75.75 0 11-1.061-1.06l1.06-1.061a.75.75 0 011.061 0z', 'moon': 'M9.598 1.591a.75.75 0 01.785-.175 7 7 0 11-8.967 8.967.75.75 0 01.961-.96 5.5 5.5 0 007.046-7.046.75.75 0 01.175-.786zm1.616 1.945a7 7 0 01-7.678 7.678 5.5 5.5 0 107.678-7.678z', 'sync': 'M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z', 'home': 'M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z', 'github': 'M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z'};
+var IconList={'sun': 'M8 10.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM8 12a4 4 0 100-8 4 4 0 000 8zM8 0a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0V.75A.75.75 0 018 0zm0 13a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 018 13zM2.343 2.343a.75.75 0 011.061 0l1.06 1.061a.75.75 0 01-1.06 1.06l-1.06-1.06a.75.75 0 010-1.06zm9.193 9.193a.75.75 0 011.06 0l1.061 1.06a.75.75 0 01-1.06 1.061l-1.061-1.06a.75.75 0 010-1.061zM16 8a.75.75 0 01-.75.75h-1.5a.75.75 0 010-1.5h1.5A.75.75 0 0116 8zM3 8a.75.75 0 01-.75.75H.75a.75.75 0 010-1.5h1.5A.75.75 0 013 8zm10.657-5.657a.75.75 0 010 1.061l-1.061 1.06a.75.75 0 11-1.06-1.06l1.06-1.06a.75.75 0 011.06 0zm-9.193 9.193a.75.75 0 010 1.06l-1.06 1.061a.75.75 0 11-1.061-1.06l1.06-1.061a.75.75 0 011.061 0z', 'moon': 'M9.598 1.591a.75.75 0 01.785-.175 7 7 0 11-8.967 8.967.75.75 0 01.961-.96 5.5 5.5 0 007.046-7.046.75.75 0 01.175-.786zm1.616 1.945a7 7 0 01-7.678 7.678 5.5 5.5 0 107.678-7.678z', 'sync': 'M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z', 'home': 'M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z', 'github': 'M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z', 'copy': 'M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z', 'check': 'M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z'};
 var utterancesLoad=0;
 
 let themeSettings={
@@ -1024,7 +1032,70 @@ function iFrameLoading(){
     }
 }
 
+document.addEventListener('DOMContentLoaded', () => {
+    const createClipboardHTML = (codeContent, additionalClasses = '') => `
+        <pre class="notranslate"><code class="notranslate">${codeContent}</code></pre>
+        <div class="clipboard-container position-absolute right-0 top-0 ${additionalClasses}">
+            <clipboard-copy class="ClipboardButton btn m-2 p-0" role="button" style="display: inherit;">
+                <svg height="16" width="16" class="octicon octicon-copy m-2"><path d="${IconList["copy"]}"></path></svg>
+                <svg height="16" width="16" class="octicon octicon-check color-fg-success m-2 d-none"><path d="${IconList["check"]}"></path></svg>
+            </clipboard-copy>
+            <div class="copy-feedback">Copied!</div>
+        </div>
+    `;
 
+    const handleCodeElements = (selector = '') => {
+        document.querySelectorAll(selector).forEach(codeElement => {
+            const codeContent = codeElement.innerHTML;
+            const newStructure = document.createElement('div');
+            newStructure.className = 'snippet-clipboard-content position-relative overflow-auto';
+            newStructure.innerHTML = createClipboardHTML(codeContent);
+
+            const parentElement = codeElement.parentElement;
+            if (selector.includes('highlight')) {
+                parentElement.insertBefore(newStructure, codeElement.nextSibling);
+                parentElement.removeChild(codeElement);
+            } else {
+                parentElement.parentElement.replaceChild(newStructure, parentElement);
+            }
+        });
+    };
+
+    handleCodeElements('pre.notranslate > code.notranslate');
+    handleCodeElements('div.highlight > pre.notranslate');
+
+    let currentFeedback = null;
+    document.querySelectorAll('clipboard-copy').forEach(copyButton => {
+        copyButton.addEventListener('click', () => {
+            const codeContent = copyButton.closest('.snippet-clipboard-content').innerText;
+            const tempTextArea = document.createElement('textarea');
+            tempTextArea.value = codeContent;
+            document.body.appendChild(tempTextArea);
+            tempTextArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempTextArea);
+
+            const copyIcon = copyButton.querySelector('.octicon-copy');
+            const checkIcon = copyButton.querySelector('.octicon-check');
+            const copyFeedback = copyButton.nextElementSibling;
+
+            if (currentFeedback && currentFeedback !== copyFeedback) {currentFeedback.style.display = 'none';}
+            currentFeedback = copyFeedback;
+
+            copyIcon.classList.add('d-none');
+            checkIcon.classList.remove('d-none');
+            copyFeedback.style.display = 'block';
+            copyButton.style.borderColor = 'var(--color-success-fg)';
+
+            setTimeout(() => {
+                copyIcon.classList.remove('d-none');
+                checkIcon.classList.add('d-none');
+                copyFeedback.style.display = 'none';
+                copyButton.style.borderColor = '';
+            }, 2000);
+        });
+    });
+});
 
 </script>
 
