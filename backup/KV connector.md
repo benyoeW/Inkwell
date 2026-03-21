@@ -597,32 +597,85 @@ def get_num_new_matched_tokens(
 
 
 
-## 加载
-Prefill阶段：计算prompt的完整KV缓存 → 需要卸载到远端。生产者
-Decode阶段：每次只生成一个token的KV缓存 → 不需要卸载（太小）。消费者
-
-特殊情况：
-每个block32个token，
-
 ## 卸载
 
-Model Execution
-    ↓
-[GPU KV Cache Updated]
-    ↓
-save_kv_layer() 遍历各层
-    ├── 构建(src_gpu, dst_cpu)传输描述符
-    ├── 提交异步传输任务
-    └── 记录传输状态
-    ↓
-wait_for_save() 
-    ├── 检查传输完成状态
-    ├── 错误处理/重试
-    └── 释放已传输的GPU块
+关于KV的卸载每个step会发生什么：
+
+### 阶段 A：Scheduler 调度（schedule()）
+A1. allocate_slots 申请 GPU 显存（发生在模型前向之前）
+    为新要计算的token在GPU KV cache pool 申请GPU显存，
+A2. build_connector_meta 决定 Store 任务
+    每一个step都为上一个step的到的新的KV cache检查一下是否有新的KVblock需要store
+    TransferSpec 只是记录了"将来要从哪些 GPU block 传到哪些 CPU block"
+A3. _update_after_schedule 更新 num_computed_tokens
+
+### 阶段 B：Worker 执行（execute_model）
+B1. pre_forward（model_runner.py:949 → kv_connector.py:62）
+    提交上一轮积压的 store job！
+    创建卸载的CUDA stream，用于KV的offload
+    关键1：等待当前推理 CUDA stream 的所有计算完成，再开始 offload（利用wait）
+    关键2：stream是为了确保提交的 transfer job串行
+B2. 模型前向计算
+    将得到的KV写入GPU显存
+B3. post_forward
+```
+# wait_for_save → prepare_store_kv：本步 reqs_to_store 为空，无新任务
+# get_finished()：
+for job_id, success in self.worker.get_finished():
+    # SingleDirectionOffloadingHandler.get_finished() 查询 CUDA event
+    # DMA传输 完成了吗？
+
+这里一个请求的卸载传输是否完成取决于两个条件：
+1. 数据的传输是否完毕
+2. 请求是否结束
+只有这样都满足条件之后结束后才会触发 finished_sending → complete_store → is_ready=True
+
+```
+
+### 举例
+
+#### 背景参数确认
+
+gpu_block_size = 16 token（1 个 GPU block 存 16 个 token 的 K/V）
+offloaded_block_size = 32 token（2 个 GPU block = 1 个 offloaded block）
+block_size_factor = 32 / 16 = 2
+
+prompt = 200 token
+需要 GPU block 数 = ⌈200/16⌉ = 13 个（前 12 个满，第 13 个存 8 个 token）
+可以凑出的完整 offloaded block = 200 // 32 = 6 个（覆盖前 192 token = 12 个 GPU block）
+剩余 8 个 token（第 13 个 GPU block）不满足 offloaded_block_size，本轮不 offload
+
+#### Step 1 结束时的状态总结
+```
+GPU 显存：
+  Block 0~11：完整存储 token 1~192 的 KV（每层），数据已写入
+  Block 12：存储 token 193~200 的 KV（每层 8/16 slot 有效），数据已写入
+
+CPU 内存：
+  CPU block 0~5：已分配（LRU manager 知道这些位置），但数据尚未写入
+  （manager 中 is_ready=False，状态为 pending）
+
+Connector 状态：
+  _unsubmitted_store_jobs = [(job_id=0, TransferSpec(GPU[0..11]→CPU[0..5]))]
+  _next_stored_block_idx["A"] = 6
+```
+
+#### Step 2 结束时的状态总结
+```
+GPU 显存：
+  Block 0~11：仍保留（decode 需要读这些 KV 做 attention），数据未变
+  Block 12：第 9 个 slot 已写入新 token 的 KV
+
+CPU 内存（如果 DMA 完成）：
+  CPU block 0~5：已存入 token 1~192 的全部层 KV
+  （is_ready 还是 False，因为 complete_store 未被调用）
+```
+
+  → 等到请求 A 结束后触发 finished_sending → complete_store → is_ready=True
+
 
 **卸载的时候会检查block的唯一性，只保存不存在的KVcache；**
 
-**在卸载的时候一般会将信息存储到manager的内存结构中；**
 
 
 
